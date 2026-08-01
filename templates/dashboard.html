@@ -1,0 +1,35 @@
+<title>Dashboard — {{ student_name }}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+
+<div class="dash-page">
+  <div class="dash-header">
+    <a href="/batch/{{ batch_id }}" class="link-btn">&larr; Back to reports</a>
+    <h1>{{ student_name }} — Execution Dashboard</h1>
+    <p class="subtitle" id="dash-subtitle">Live view of every pipeline step, from upload to PDF.</p>
+  </div>
+
+  <div class="dash-split">
+    <div class="card dash-steps" id="dash-steps">
+      {% for key, label in steps %}
+      <button class="dash-step" data-step="{{ key }}">
+        <span class="dash-step-dot pending" id="dot-{{ key }}"></span>
+        <span>{{ label }}</span>
+        <span class="dash-step-time" id="time-{{ key }}"></span>
+      </button>
+      {% endfor %}
+    </div>
+
+    <div class="card dash-detail">
+      <p class="section-label" id="detail-title">Select a step</p>
+      <div id="detail-body">
+        <p class="meta">Click a step on the left, or wait — the currently running step opens automatically.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  window.BATCH_ID = "{{ batch_id }}";
+  window.STUDENT_ID = "{{ student_id }}";
+</script>
+<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>

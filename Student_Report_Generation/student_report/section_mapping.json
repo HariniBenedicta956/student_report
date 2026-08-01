@@ -1,0 +1,439 @@
+{
+  "_source": "Built from UIT.md (End-of-Pre-Camp Student Diagnostic and Reflection, full question bank) cross-referenced against results-6c0699d6-...csv (the actual export's Q-numbering).",
+  "_excluded": "Q1/Q2 (consent), Q5 (degree/programme -- branch already covers Q6), and Q48-Q54 (Section H/I/J/K: pre/post mindset-shift battery, session feedback, presenter feedback, bootcamp interest -- a different instrument from the career-readiness diagnostic per UIT.md's own section structure) are left unmapped/raw-context rather than forced into B-G.",
+  "_ordinal_design": "Sections B-E are self-report 'which statement best describes you' questions with a genuine low->high maturity gradient, so options_low_to_high is filled in. Sections F-G are scenario/best-practice-judgment questions (UIT.md itself says to randomise their option order and hide the correct answer after submission -- i.e. one correct answer plus distractors, not a smooth scale), so ranking the distractors against each other would be guesswork; these are left fully AI-judged from the raw answer text instead, same mechanism as multi-select. A few individual questions (Q8, Q10, Q18) are also non-ordinal/categorical and intentionally left empty -- see the '_note' on each. Trailing not-applicable options (e.g. 'I have not yet had such an experience') are deliberately left OUT of a question's options_low_to_high so they fall back to AI judgment instead of being forced into a maturity position.",
+  "_caveat": "Option text is transcribed from UIT.md. Exact-match scoring against the live CSV depends on punctuation (curly vs straight apostrophes, en-dashes) matching exactly -- a mismatch just falls back to AI-only judgment for that answer (no crash), so this is a soft risk, not a blocker.",
+  "ignored_columns": [
+    "Rank",
+    "Mobile",
+    "Score",
+    "Max",
+    "Band",
+    "Qualifies",
+    "Warnings",
+    "Submitted At"
+  ],
+  "identity_columns": {
+    "name": "Name",
+    "roll_number": "Q3",
+    "institution": "Q4",
+    "branch": "Q6",
+    "year": "Q7"
+  },
+  "sections": {
+    "B": {
+      "label": "Career clarity & direction",
+      "questions": [
+        {
+          "column": "Q8",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "_note": "Categorical (different post-graduation paths, not a maturity gradient) -- AI-judged.",
+          "full_question": "What are you currently most likely to pursue immediately after graduation?"
+        },
+        {
+          "column": "Q9",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I am still unclear about the available paths.",
+            "I am mainly following what family, friends or faculty recommend.",
+            "I am considering two or three possible paths.",
+            "I am actively exploring through projects, internships or conversations.",
+            "I have a clear goal but no structured action plan yet.",
+            "I have a clear goal and a specific action plan."
+          ],
+          "full_question": "Which statement best describes your present career clarity?"
+        },
+        {
+          "column": "Q10",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "_note": "UIT.md itself annotates this 'an aspiration question, not a merit question' -- AI-judged, not ranked.",
+          "full_question": "What level of preparation do you currently aspire to achieve?"
+        },
+        {
+          "column": "Q11",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I currently focus almost entirely on academic requirements.",
+            "I have not yet developed a consistent preparation approach.",
+            "I mainly complete courses and certifications.",
+            "I am preparing for aptitude tests, interviews or competitive examinations.",
+            "I regularly learn topics beyond the syllabus.",
+            "I build projects or participate in internships, research or competitions.",
+            "I combine learning, projects and documentation to build evidence of capability."
+          ],
+          "full_question": "Which statement best describes your preparation beyond regular college requirements?"
+        },
+        {
+          "column": "Q12",
+          "multi_select": true,
+          "options_low_to_high": [],
+          "full_question": "What are your three biggest concerns about your future? (Select up to three.)"
+        },
+        {
+          "column": "Q13",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I am not currently interested in entrepreneurship.",
+            "I like the idea but do not know where to begin.",
+            "I want to start something as soon as I find an idea.",
+            "I want to become a strong builder before taking a larger entrepreneurial risk.",
+            "I first want to learn how to understand users, build, test and improve solutions.",
+            "I have attempted a business, freelance project or customer-facing solution."
+          ],
+          "_note": "Best-effort ordering -- the middle three (start-as-soon-as / become-a-builder-first / learn-users-first) are debatable relative to each other, worth a sanity check.",
+          "full_question": "Which statement is closest to your present view of entrepreneurship?"
+        }
+      ]
+    },
+    "C": {
+      "label": "Curiosity & reading depth",
+      "questions": [
+        {
+          "column": "Q14",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I have rarely or never used a book, even for academic learning.",
+            "I use books only when an academic activity specifically requires them.",
+            "I use textbooks or reference books, but rarely read outside academics.",
+            "I mainly read fiction outside academic requirements.",
+            "I mainly read non-fiction outside academic requirements.",
+            "I occasionally read both fiction and non-fiction.",
+            "I regularly complete books across different subjects or genres.",
+            "I am a voracious reader and read widely throughout the year."
+          ],
+          "full_question": "Which statement best describes your use of books since completing school?"
+        },
+        {
+          "column": "Q15",
+          "multi_select": false,
+          "options_low_to_high": [
+            "None",
+            "One",
+            "Two or three",
+            "Four to six",
+            "Seven to twelve",
+            "More than twelve"
+          ],
+          "full_question": "Approximately how many complete books have you read during the last 12 months, excluding books used only for examinations?"
+        },
+        {
+          "column": "Q16",
+          "multi_select": true,
+          "options_low_to_high": [],
+          "full_question": "What kinds of books or long-form material do you read voluntarily? (Select all that apply.)"
+        },
+        {
+          "column": "Q17",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I rarely or never engage with science fiction.",
+            "I occasionally watch science-fiction films or series.",
+            "I regularly watch science-fiction films or series.",
+            "I read science-fiction stories or books in addition to watching them.",
+            "I actively explore whether the scientific or technological ideas shown could work.",
+            "Science, future technology and speculative ideas are major personal interests."
+          ],
+          "full_question": "Which statement best describes your engagement with science fiction or future-technology stories?"
+        },
+        {
+          "column": "Q18",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "_note": "Different source types, not a clean gradient (e.g. 'textbooks' isn't unambiguously more mature than 'official documentation') -- AI-judged.",
+          "full_question": "When learning a technical topic, which source do you depend on most?"
+        },
+        {
+          "column": "Q19",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I memorise likely questions and expected answers.",
+            "I revise notes, videos or AI-generated summaries repeatedly.",
+            "I understand the main ideas but depend on memorised wording.",
+            "I understand the concept and practise applying it to different problems.",
+            "I connect the concept to fundamentals, applications and related subjects and try to explain it without notes."
+          ],
+          "full_question": "Which statement best describes how you usually prepare for an examination, interview or technical evaluation?"
+        }
+      ]
+    },
+    "D": {
+      "label": "AI-use maturity & learning discipline",
+      "questions": [
+        {
+          "column": "Q20",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I rarely or never use AI.",
+            "I mainly use AI to complete work more quickly.",
+            "I use AI for explanations but usually do not verify the response.",
+            "I use AI to generate ideas or code and check whether the output works.",
+            "I verify AI output using documentation, experiments or other reliable sources.",
+            "I use AI as one input, but ensure that I understand and can explain the final work."
+          ],
+          "full_question": "Which statement best describes how you currently use AI for learning or technical work?"
+        },
+        {
+          "column": "Q21",
+          "multi_select": false,
+          "options_low_to_high": [
+            "Less than one hour",
+            "1–3 hours",
+            "4–6 hours",
+            "7–10 hours",
+            "More than 10 hours"
+          ],
+          "full_question": "In a typical week, how much time do you spend learning beyond compulsory college activities?"
+        },
+        {
+          "column": "Q22",
+          "multi_select": false,
+          "options_low_to_high": [
+            "Rarely",
+            "Mainly before examinations or deadlines",
+            "Occasionally, when I feel motivated",
+            "At least once or twice during most weeks",
+            "On a planned weekly routine",
+            "On a sustained routine with recorded goals or outputs"
+          ],
+          "full_question": "During the last three months, how consistently have you worked on learning beyond compulsory college activities?"
+        },
+        {
+          "column": "Q23",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I have not yet attempted one.",
+            "Less than one week",
+            "One week to one month",
+            "One to three months",
+            "Three to six months",
+            "Six months to one year",
+            "More than one year"
+          ],
+          "full_question": "What is the longest period for which you have continuously worked on one self-initiated project, learning goal or creative activity?"
+        }
+      ]
+    },
+    "E": {
+      "label": "Practical exposure & building",
+      "questions": [
+        {
+          "column": "Q24",
+          "multi_select": true,
+          "options_low_to_high": [],
+          "_note": "UIT.md explicitly says: 'Do not score this simply by counting selections.'",
+          "full_question": "Which of the following have you personally attempted outside routine academic requirements? (Select all that apply.)"
+        },
+        {
+          "column": "Q25",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I have not yet attempted such an activity.",
+            "I mainly observed others.",
+            "I followed a tutorial or reproduced an existing project.",
+            "I completed one clearly assigned component.",
+            "I built a substantial part and solved some problems independently.",
+            "I helped define the problem, connect different components and test the result.",
+            "I independently identified the problem, built something, tested it and improved it.",
+            "I had no formal project opportunity, but independently learned and created a working demonstration."
+          ],
+          "full_question": "Think about your most significant project, experiment or independent learning activity. Which statement best describes your personal role?"
+        },
+        {
+          "column": "Q26",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I stopped working on it.",
+            "I asked someone else to solve it.",
+            "I repeated the same approach.",
+            "I changed several things without isolating the cause.",
+            "I identified a possible cause and changed my approach.",
+            "I recorded what happened, tested possible causes and improved the solution."
+          ],
+          "_note": "'I have not yet had such an experience.' intentionally excluded (not a maturity position) -- falls back to AI judgment for those students.",
+          "full_question": "When something failed in your project or learning activity, what did you most often do?"
+        },
+        {
+          "column": "Q27",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I cannot currently explain one in depth.",
+            "I can describe the final output.",
+            "I can explain the part I personally worked on.",
+            "I can explain most components and how they connect.",
+            "I can explain the problem, architecture, choices, failures, testing and limitations.",
+            "I can defend the work under questioning and identify how it should be improved."
+          ],
+          "full_question": "Which statement best describes your ability to explain your strongest project or area of learning?"
+        },
+        {
+          "column": "Q28",
+          "multi_select": true,
+          "options_low_to_high": [],
+          "full_question": "Which of the following currently provide public or reviewable evidence of your work? (Select all that apply.)"
+        },
+        {
+          "column": "Q29",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I do not have a GitHub account.",
+            "I have an account but no meaningful repositories.",
+            "I mainly view, download or fork other people's work.",
+            "I have uploaded academic exercises or tutorial-based projects.",
+            "I maintain at least one original project.",
+            "My repositories include documentation, setup instructions and demonstrations.",
+            "I contribute meaningfully to projects several times each month.",
+            "GitHub is part of my regular development workflow and reflects sustained, meaningful work."
+          ],
+          "_note": "'GitHub is not relevant to the kind of work I currently do.' intentionally excluded -- falls back to AI judgment for those students.",
+          "full_question": "Which statement best describes your GitHub activity?"
+        },
+        {
+          "column": "Q30",
+          "multi_select": false,
+          "options_low_to_high": [
+            "I rarely explain what I learn to others.",
+            "I informally help friends or classmates.",
+            "I have explained topics during class or team presentations.",
+            "I create notes, slides, posts or videos to help others understand.",
+            "I maintain a YouTube channel, blog or portfolio containing original explanations or demonstrations.",
+            "I regularly teach, mentor or publish and improve based on feedback."
+          ],
+          "full_question": "Which statement best describes how you explain or publicly share what you learn?"
+        }
+      ]
+    },
+    "F": {
+      "label": "Coachability & problem-solving approach",
+      "questions": [
+        {
+          "column": "Q31",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Clarify the intended outcome and constraints, state necessary assumptions and begin with a small test.",
+          "full_question": "You receive an assignment with an incomplete description and an approaching deadline. What would you most likely do first?"
+        },
+        {
+          "column": "Q32",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Compare their assumptions and evidence, then verify through documentation or testing.",
+          "full_question": "Two reliable-looking sources provide different explanations for the same technical issue. What would you most likely do?"
+        },
+        {
+          "column": "Q33",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Record what happened, isolate one possible cause and test it.",
+          "full_question": "You have attempted the same problem several times and it continues to fail. What would you most likely do next?"
+        },
+        {
+          "column": "Q34",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Ask for specific feedback, revisit the assumptions and rebuild weak areas where necessary.",
+          "full_question": "A mentor tells you that your output works, but your understanding and design are weak. What would you most likely do?"
+        },
+        {
+          "column": "Q35",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Examine the evidence, compare assumptions and test the competing approaches where practical.",
+          "full_question": "A teammate presents evidence that your preferred design may fail under higher load. What would you do first?"
+        }
+      ],
+      "_note": "Scenario/best-practice-judgment questions (see _ordinal_design). Empirically, leaving these with no computed hint at all caused the model to return null instead of scoring the section, so each question is tagged with its single correct_answer (from UIT.md) -- scoring.py turns % of scenario answers matched into a real computed hint (100=all matched, 0=none), same as any other section. The AI still writes the narrative from the raw answers, this only fixes the missing-hint problem."
+    },
+    "G": {
+      "label": "Systems & critical thinking",
+      "questions": [
+        {
+          "column": "Q36",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "“Quickly” is not defined in measurable terms.",
+          "full_question": "A requirement states: “The application should respond quickly.” What is the main problem with this requirement?"
+        },
+        {
+          "column": "Q37",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Which students are affected, and what specifically are they unhappy about?",
+          "full_question": "A stakeholder says, “Students are unhappy with the portal.” What is the best first question?"
+        },
+        {
+          "column": "Q38",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "The software update caused the complaints.",
+          "full_question": "A report states: “Complaints increased after the latest software update.” Which conclusion is not justified by that statement alone?"
+        },
+        {
+          "column": "Q39",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "The available information is insufficient; evidence from multiple layers is required.",
+          "full_question": "A user taps a button and sees: “Something went wrong. Please try again.” What is the most responsible technical conclusion?"
+        },
+        {
+          "column": "Q40",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Algorithmic complexity, database load or shared-resource contention",
+          "full_question": "A system works well for 20 users but becomes slow when 1,000 users access it simultaneously. Which factor should be investigated first?"
+        },
+        {
+          "column": "Q41",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Data may accumulate, be overwritten or be lost unless buffering and flow control are designed.",
+          "full_question": "A sensor sends one reading every second, but the receiving system processes only one reading per minute. What is the most likely concern?"
+        },
+        {
+          "column": "Q42",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "One component depends on the other component’s internal data format and implementation details.",
+          "full_question": "Which situation demonstrates strong coupling between two components?"
+        },
+        {
+          "column": "Q43",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Decide based on failure impact, budget, reliability requirements and recovery options.",
+          "full_question": "A team has two possible designs. Design A: lower cost, but one component failure can stop the entire system. Design B: higher cost, but the system continues operating after one component fails. How should the team choose?"
+        },
+        {
+          "column": "Q44",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "The code works under that tested condition, but wider validation is still required.",
+          "full_question": "AI generates code that passes one demonstration test. What can the team reasonably conclude?"
+        },
+        {
+          "column": "Q45",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Prioritise using impact, risk, dependencies and effort.",
+          "full_question": "A team has limited time and money to address ten known system problems. What is the best way to decide the order?"
+        },
+        {
+          "column": "Q46",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Its expected impact may still be high because the consequence is severe.",
+          "full_question": "A software defect occurs only once a year but can cause major financial or safety consequences. Why might it still deserve high priority?"
+        },
+        {
+          "column": "Q47",
+          "multi_select": false,
+          "options_low_to_high": [],
+          "correct_answer": "Improve alert thresholds, add context and verify high-risk cases.",
+          "full_question": "A monitoring system produces many alerts, but only a small percentage correspond to real failures. What is the best improvement?"
+        }
+      ],
+      "_note": "Scenario/best-practice-judgment questions. UIT.md itself says to randomise option order and hide the correct answer, confirming this is a right/wrong assessment. Each question is tagged with its correct_answer (from UIT.md) so scoring.py can compute a real hint (see F's _note for why this was necessary) -- the AI still writes the narrative from the raw answers, correctness just anchors the numeric score instead of the AI having to invent one from nothing."
+    }
+  }
+}

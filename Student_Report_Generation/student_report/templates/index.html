@@ -1,0 +1,57 @@
+<title>Career Readiness Report Generator</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+
+<div class="page">
+  <h1>Career Readiness Report Generator</h1>
+  <p class="subtitle">Upload a survey CSV, add an instruction, generate a personalized PDF report per student.</p>
+
+  <div class="error-banner" id="error-banner"></div>
+
+  <div class="card">
+    <div class="upload-row">
+      <label class="dropzone" id="dropzone">
+        <input type="file" id="file-input" accept=".csv">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span id="dropzone-text">Drop student CSV here</span>
+        <span class="filename" id="dropzone-filename"></span>
+      </label>
+
+      <div class="prompt-box">
+        <label class="field-label">Context prompt</label>
+        <textarea id="instructions" placeholder="e.g. focus on career readiness, or list every question and answer"></textarea>
+      </div>
+    </div>
+
+    <label class="field-label">Question bank (optional)</label>
+    <label class="dropzone dropzone-inline" id="qbank-dropzone">
+      <input type="file" id="qbank-file-input" accept=".md,.txt,.csv,.pdf,.docx">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span id="qbank-text">Drop the full question bank here when the survey changes (e.g. UIT.md) — saved for review, not auto-applied</span>
+      <span class="filename" id="qbank-filename"></span>
+    </label>
+  </div>
+
+  <div class="card" id="student-select-card" style="display:none;">
+    <div class="top-actions">
+      <span class="count" id="select-count">0 selected</span>
+      <div class="buttons">
+        <button class="link-btn" id="select-all-btn">Select all</button>
+        <button class="link-btn" id="select-none-btn">Select none</button>
+      </div>
+    </div>
+    <div id="student-checklist"></div>
+  </div>
+
+  <button class="btn-primary" id="generate-btn" disabled>
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.8 5.2L19 9l-5.2 1.8L12 16l-1.8-5.2L5 9l5.2-1.8L12 2z"/></svg>
+    <span id="generate-btn-text">Generate reports</span>
+  </button>
+</div>
+
+<script src="{{ url_for('static', filename='js/index.js') }}"></script>

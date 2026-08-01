@@ -1,0 +1,37 @@
+{
+  "_comment": "PLACEHOLDER SCHEMA -- not real data. Copy this to section_mapping.json and fill in with the actual CSV column headers and answer options once the real survey export is available. See README.md.",
+  "_column_matching": "The 'column' value can be an exact header (e.g. 'Name') or, for Google-Forms-style exports where headers are prefixed like 'Q8: ...', just the stable prefix (e.g. 'Q8') -- matching by prefix survives header text being truncated or re-encoded on export.",
+
+  "ignored_columns": ["REPLACE: any platform/bookkeeping column that isn't survey content, e.g. a pre-computed Score/Max/Rank -- these are dropped entirely rather than shown to the AI, since a raw numeric field like 'Score: 11/Max: 12' can anchor the AI into the wrong scoring scale"],
+
+  "identity_columns": {
+    "name": "REPLACE_WITH_EXACT_CSV_HEADER",
+    "roll_number": "REPLACE_WITH_EXACT_CSV_HEADER",
+    "institution": "REPLACE_WITH_EXACT_CSV_HEADER",
+    "branch": "REPLACE_WITH_EXACT_CSV_HEADER",
+    "year": "REPLACE_WITH_EXACT_CSV_HEADER"
+  },
+
+  "sections": {
+    "B": {
+      "label": "Career clarity & direction",
+      "questions": [
+        {
+          "column": "REPLACE_WITH_EXACT_CSV_HEADER",
+          "multi_select": false,
+          "options_low_to_high": [
+            "REPLACE: lowest-maturity option text, exactly as it appears in the CSV",
+            "REPLACE: next option",
+            "REPLACE: highest-maturity option text"
+          ],
+          "full_question": "REPLACE (optional): the full, untruncated question text from the actual question bank/form -- CSV exports often truncate long headers with '...', and the AI only ever sees what's here. If omitted, the (possibly truncated) 'column' header text is used instead."
+        }
+      ]
+    },
+    "C": { "label": "Curiosity & reading depth", "questions": [] },
+    "D": { "label": "AI-use maturity & learning discipline", "questions": [] },
+    "E": { "label": "Practical exposure & building", "questions": [] },
+    "F": { "label": "Coachability & problem-solving approach", "questions": [] },
+    "G": { "label": "Systems & critical thinking", "questions": [] }
+  }
+}
