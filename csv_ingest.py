@@ -131,6 +131,13 @@ def parse_csv(file_bytes, mapping):
                 # question when asked to list or reference specific questions.
                 question_text = q_config.get("full_question") or column
                 sections[section_key].append({
+                    # The mapping's own stable identifier for this question (e.g.
+                    # "Q31"). Prompt-building keys each student's answers by this
+                    # rather than by position in the list: blank answers are skipped
+                    # above, so two students can end up with different-length section
+                    # lists, and positional numbering would silently pair a student's
+                    # answer with the wrong question.
+                    "qid": q_config["column"],
                     "question": question_text,
                     "answer": answer,
                     "multi_select": is_multi,

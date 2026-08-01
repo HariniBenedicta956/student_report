@@ -64,25 +64,31 @@ def _call_host(host, model, messages):
             "messages": messages,
             "stream": True,
             "format": "json",
+            # Hold the model (and its KV cache) in memory between calls instead of
+            # letting Ollama unload it after its ~5 minute idle default. The load
+            # time this saves is minor (~3.4s); what matters is that unloading also
+            # throws away the cached evaluation of our shared system prompt, which
+            # is the single biggest saving available here -- see config.OLLAMA_KEEP_ALIVE.
+            "keep_alive": config.OLLAMA_KEEP_ALIVE,
             "options": {
                 # Lower temperature -- this call only needs reliably well-formed JSON
                 # that follows instructions, not creative variety, and a wandering/
                 # high-temp completion is more likely to produce something that fails
                 # to parse.
-                "temperature": 0.3,
+                "temperature": config.OLLAMA_TEMPERATURE,
                 # Ollama defaults num_ctx to as little as 2048-4096 tokens unless told
-                # otherwise. Our system+user payload (schema + a ~40-50 question JSON
-                # dump) runs 4000-5000+ tokens -- past a small default, Ollama silently
+                # otherwise. Our system+user payload (schema + question bank + answers)
+                # runs 4000-5000+ tokens -- past a small default, Ollama silently
                 # truncates older context rather than erroring, which would explain
                 # both instructions getting dropped (system message pushed out) and
                 # incomplete answer listings (later questions never reaching the
                 # model). A direct chat session with a short, one-off question would
                 # never hit this ceiling, which is the real reason it can look like
                 # Hermes "can't do the same thing" through this app.
-                "num_ctx": 8192,
+                "num_ctx": config.OLLAMA_NUM_CTX,
                 # Generous output cap so a long request (e.g. "list every question and
                 # answer") has room to complete instead of being cut off mid-response.
-                "num_predict": 4096,
+                "num_predict": config.OLLAMA_NUM_PREDICT,
             },
         },
         timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),

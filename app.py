@@ -17,6 +17,7 @@ import ollama_client
 import pdf_generator
 import perf_logging
 import prompt_builder
+import report_queue
 import storage
 
 logging.basicConfig(level=logging.INFO)
@@ -206,19 +207,43 @@ def _run_batch(batch_id, students, manifest, mapping, instructions_text, shared_
     the whole batch left the UI showing "Generating..." with zero feedback
     for minutes at a time. Screen 2 polls /batch/<id>/students instead to
     watch statuses flip from pending to done (or error) as they complete.
+
+    Students are fed through report_queue rather than looped over directly, so a
+    failure is contained to the one student it belongs to and throughput is a
+    single config knob (config.REPORT_WORKERS) instead of a structural property of
+    this function.
     """
-    for i, student_record in enumerate(students):
-        student_id = manifest["students"][i]["student_id"]
-        try:
-            _generate_one(batch_id, student_id, i, student_record, mapping,
-                           instructions_text, shared_trace)
-        except Exception:
-            log.exception("Unexpected failure generating %s in batch %s", student_id, batch_id)
-            storage.update_student_status(batch_id, student_id, "error")
+    # Built once for the whole batch, not per student. Every student in a batch is
+    # answering the same survey, so this text is identical for all of them -- and
+    # keeping it byte-identical is what lets Ollama reuse its cached evaluation of
+    # it instead of re-reading the same ~7.5KB of question text for every student.
+    question_bank = prompt_builder.build_question_bank(mapping, students)
+
+    def handle(item):
+        index, student_id, student_record = item
+        _generate_one(batch_id, student_id, index, student_record, mapping,
+                       instructions_text, shared_trace, question_bank)
+
+    def handle_error(item, exc):
+        _, student_id, _ = item
+        log.error("Unexpected failure generating %s in batch %s: %s", student_id, batch_id, exc)
+        storage.update_student_status(batch_id, student_id, "error")
+
+    items = [
+        (i, manifest["students"][i]["student_id"], record)
+        for i, record in enumerate(students)
+    ]
+    stats = report_queue.process(
+        items, handle,
+        workers=config.REPORT_WORKERS,
+        on_error=handle_error,
+        label=batch_id,
+    )
+    perf_logging.log_batch(batch_id, stats.as_dict(), config.REPORT_WORKERS)
 
 
 def _generate_one(batch_id, student_id, student_index, student_record, mapping,
-                   instructions_text, shared_trace):
+                   instructions_text, shared_trace, question_bank=None):
     trace = execution_trace.new_trace()
     trace["upload_csv"] = shared_trace["upload_csv"]
     trace["validate"] = shared_trace["validate"]
@@ -255,7 +280,9 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
             )
             prompt_code = execution_trace.get_code(prompt_builder, "build_advice_messages")
         else:
-            messages = prompt_builder.build_messages(student_record, mapping, instructions_text)
+            messages = prompt_builder.build_messages(
+                student_record, mapping, instructions_text, question_bank
+            )
             prompt_code = execution_trace.get_code(prompt_builder, "build_messages")
     execution_trace.set_step(
         trace, "build_prompt", "done",

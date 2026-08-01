@@ -31,6 +31,41 @@ else:
 OLLAMA_HERMES3_MODEL = os.environ.get("OLLAMA_HERMES3_MODEL", "hermes3:8b")
 OLLAMA_LLAMA3_MODEL = os.environ.get("OLLAMA_LLAMA3_MODEL", "llama3:8b")
 
+# How many students the report queue works on at once.
+#
+# Default 1 on purpose. Measured against the real Ollama host (hermes3:8b,
+# CPU-only): 3 concurrent requests took 8.4s vs 8.1s for the same 3 run
+# sequentially -- 0.96x, i.e. no gain at all. The requests simply queued
+# server-side (finishing in a clean 2.8s staircase), because Ollama was serving
+# one request at a time and a single generation already saturates the CPU.
+#
+# So the queue exists for control -- ordering, isolation, bounded retries,
+# per-student failure containment, and a single place to raise throughput later
+# -- not because parallel requests are currently faster. Raising this only pays
+# off once the Ollama host can genuinely serve more than one request at a time:
+# a GPU with OLLAMA_NUM_PARALLEL>1, or a second host in OLLAMA_HOSTS. Note that
+# Ollama splits num_ctx across parallel slots, so raising NUM_PARALLEL without
+# also raising the server's context budget can silently truncate our prompt.
+REPORT_WORKERS = int(os.environ.get("REPORT_WORKERS", "1"))
+
+# Keeps the model resident between requests and between batches. Ollama
+# otherwise unloads it after ~5 minutes idle (confirmed: /api/ps was empty
+# between runs), which costs a cold load on the next batch -- but far more
+# importantly it discards the KV cache that lets the shared part of our prompt
+# be reused instead of re-evaluated. Prompt evaluation is the single largest
+# cost in a report (measured 55% of total time), so holding that cache is worth
+# far more than the load time it also saves.
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
+
+# Ollama defaults num_ctx to as little as 2048-4096 unless told otherwise, and
+# silently drops older context rather than erroring past that -- which quietly
+# truncates the question bank and the requester's instructions.
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+OLLAMA_NUM_PREDICT = int(os.environ.get("OLLAMA_NUM_PREDICT", "4096"))
+# Low temperature: this call needs reliably well-formed, instruction-following
+# JSON, not creative variety.
+OLLAMA_TEMPERATURE = float(os.environ.get("OLLAMA_TEMPERATURE", "0.3"))
+
 UPLOAD_DIR = os.path.join(BASE_DIR, "data", "uploads")
 QUESTION_BANK_DIR = os.path.join(BASE_DIR, "data", "question_banks")
 BATCHES_DIR = os.path.join(BASE_DIR, "output", "batches")

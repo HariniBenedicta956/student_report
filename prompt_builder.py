@@ -130,11 +130,10 @@ request (for example {"qa_listing": [{"question": "...", "answer": "..."}],
 content -- never include an empty or placeholder field.
 
 If asked to list questions and answers (all of them, or a filtered subset like "just
-the wrong ones"), you MUST go through every single section in the user message's
-"sections" object plus every entry in "unmapped_questions" and include EVERY one that
-matches the request -- do not sample, summarize, or stop after a handful. The data has
-roughly 40 section questions plus any unmapped ones; a short list is very likely an
-incomplete one.
+the wrong ones"), you MUST go through every single entry in the user message's
+"answers" object and include EVERY one that matches the request -- do not sample,
+summarize, or stop after a handful. There are roughly 90 answers; a short list is very
+likely an incomplete one.
 
 Instructions may be phrased as a sentence, OR as a plain list of section names
 (comma-separated, or wrapped in brackets like "[Cover Page, Key Strengths, Next
@@ -160,16 +159,20 @@ def _build_system_message(mapping, instructions_text):
 
     parts = [
         "You are writing a personalized career-readiness report for one student.",
-        "The next message (role: user) contains the student's data as a JSON object: "
-        "identity, their answers grouped by section (each section includes a "
-        "computed_hint, which is a preliminary 0-100 score computed directly from the "
-        "answers -- null means there's no pre-computed number and you must judge that "
-        "section entirely yourself), and any unmapped_questions that don't belong to a "
-        "fixed section. Each answer also has is_correct: true/false for scenario "
-        "questions with a known right answer, or null where there's no single correct "
-        "answer to judge against. If asked about wrong answers, mistakes, or what to "
-        "improve on specific questions, use this is_correct field as ground truth -- "
-        "don't re-judge correctness yourself.",
+        "The next message (role: user) contains ONLY this one student's data, as a "
+        "compact JSON object with three keys. "
+        '"student" is their identity. '
+        '"section_hints" gives a preliminary 0-100 score per section computed directly '
+        "from their answers -- null means there is no pre-computed number and you must "
+        "judge that section entirely yourself. "
+        '"answers" is keyed by the question ids in the QUESTION BANK below: each value '
+        'has "a" (this student\'s answer) and, only for scenario questions with a known '
+        'right answer, "correct": true/false. Where "correct" is absent there is no '
+        "single right answer to judge against. If asked about wrong answers, mistakes, "
+        'or what to improve on specific questions, use "correct" as ground truth -- '
+        "don't re-judge correctness yourself. "
+        "Read every answer against its question in the QUESTION BANK; a question id "
+        "missing from \"answers\" means this student left it blank.",
         TONE_RULES,
         "",
         "Extra instructions from the report requester (this is the most important part "
@@ -189,62 +192,124 @@ def _build_system_message(mapping, instructions_text):
     return "\n".join(parts)
 
 
-def _build_data_payload(student_record, mapping):
-    identity = student_record["identity"]
-    sections = student_record["sections"]
-    unmapped = student_record["unmapped"]
-    hints = compute_section_hints(sections)
+def build_question_bank(mapping, student_records):
+    """
+    The part of the prompt that is byte-identical for every student in a batch:
+    section labels and the full text of every question, each tagged with the stable
+    id the per-student message uses to attach that student's answer.
 
-    sections_payload = {}
+    Built once per batch and placed in the *system* message, ahead of any
+    per-student data. That ordering is the entire point. Ollama/llama.cpp reuses
+    its KV cache only for the longest identical *leading* run of tokens between
+    consecutive prompts, so anything shared has to come first to be reused at all.
+    Measured against the real host: prompt evaluation is 55% of a report's total
+    time, and moving the repeated question text out of the per-student payload and
+    in here took evaluation for the second and later students from 146.6s to 40.5s.
+
+    Returns {"text": <bank>, "unmapped_ids": {question_text: id}} -- the id map is
+    returned rather than recomputed per student so the ids in the bank and the ids
+    in each student's payload cannot drift apart.
+    """
+    lines = [
+        "QUESTION BANK -- the user message gives one student's answers keyed by the "
+        "ids below. Read each answer against its question here."
+    ]
     for section_key, section_cfg in mapping["sections"].items():
-        sections_payload[section_key] = {
-            "label": section_cfg.get("label", section_key),
-            "computed_hint": hints.get(section_key),
-            "answers": [
-                {
-                    "question": q["question"],
-                    "answer": q["answer"],
-                    "multi_select": q["multi_select"],
-                    # true/false for scenario questions with a known correct answer
-                    # (sections F/G), null where there's no single right answer to
-                    # judge against (e.g. self-report maturity questions) -- lets a
-                    # request like "list the wrong answers" use real ground truth
-                    # instead of the model having to re-derive correctness itself.
-                    "is_correct": q["is_correct"],
-                }
-                for q in sections.get(section_key, [])
-            ],
-        }
+        lines.append("")
+        lines.append(f"[{section_key}] {section_cfg.get('label', section_key)}")
+        for question in section_cfg["questions"]:
+            text = question.get("full_question") or question["column"]
+            multi = " (multi-select)" if question.get("multi_select") else ""
+            lines.append(f"{question['column']}. {text}{multi}")
 
-    return {
+    # Questions present in the CSV but not in section_mapping.json. Their text is
+    # the same for everyone in a batch (same export, same columns), so they belong
+    # in the shared bank too -- they're over half the questions here. Unioned across
+    # the whole batch in first-seen order, because a student who left one blank
+    # simply won't have it (parse_csv drops empty answers) and the bank still has to
+    # cover everyone.
+    unmapped_ids = {}
+    for record in student_records:
+        for u in record["unmapped"]:
+            if u["question"] not in unmapped_ids:
+                unmapped_ids[u["question"]] = f"U{len(unmapped_ids) + 1}"
+    if unmapped_ids:
+        lines.append("")
+        lines.append("[U] Other questions")
+        for question_text, uid in unmapped_ids.items():
+            lines.append(f"{uid}. {question_text}")
+
+    return {"text": "\n".join(lines), "unmapped_ids": unmapped_ids}
+
+
+def _build_student_payload(student_record, mapping, question_bank):
+    """
+    Only what actually differs between students: identity, the computed section
+    hints, and the answers themselves -- keyed by question id, since the question
+    text now lives once in the shared bank instead of being repeated per student.
+
+    Serialized compactly (no indent, no spaces after separators). In the previous
+    shape 45% of this payload was indentation and repeated key names, which cost
+    real prompt-evaluation seconds on every single student while carrying no
+    information at all.
+    """
+    identity = student_record["identity"]
+    hints = compute_section_hints(student_record["sections"])
+
+    answers = {}
+    for questions in student_record["sections"].values():
+        for q in questions:
+            entry = {"a": q["answer"]}
+            # Only for scenario questions with a known correct answer (sections
+            # F/G). Omitted rather than sent as null where there's no single right
+            # answer to judge against -- absence says the same thing in fewer
+            # tokens, and the system message spells out that reading.
+            if q["is_correct"] is not None:
+                entry["correct"] = q["is_correct"]
+            answers[q["qid"]] = entry
+    for u in student_record["unmapped"]:
+        uid = question_bank["unmapped_ids"].get(u["question"])
+        if uid:
+            answers[uid] = {"a": u["answer"]}
+
+    payload = {
         "student": {
             "name": identity.get("name", ""),
             "branch": identity.get("branch", ""),
             "year": identity.get("year", ""),
             "institution": identity.get("institution", ""),
         },
-        "sections": sections_payload,
-        "unmapped_questions": [
-            {"question": u["question"], "answer": u["answer"]} for u in unmapped
-        ],
+        "section_hints": {key: hints.get(key) for key in mapping["sections"]},
+        "answers": answers,
     }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def build_messages(student_record, mapping, instructions_text):
+def build_messages(student_record, mapping, instructions_text, question_bank=None):
     """
     Returns an Ollama /api/chat messages list: a system message carrying the tone
-    rules, output schema and the requester's instructions, and a user message
-    carrying the student's data as a clean JSON object -- separating "what to do"
-    from "the data" instead of concatenating everything into one text blob, which
-    is both the natural format for a chat-tuned model like Hermes-3 and much less
-    likely to bury the requester's instructions where the model stops noticing them.
+    rules, output schema, the requester's instructions and the shared question
+    bank, and a user message carrying only this student's own answers -- separating
+    "what to do" from "who this is" instead of concatenating everything into one
+    text blob, which is both the natural format for a chat-tuned model like
+    Hermes-3 and much less likely to bury the requester's instructions where the
+    model stops noticing them.
+
+    question_bank is normally built once per batch and passed in, so it is
+    identical across students and its KV cache can be reused. Omitting it builds a
+    single-student bank on the spot, which keeps this function usable on its own
+    (tests, one-off calls) at the cost of that reuse.
     """
-    system_content = _build_system_message(mapping, instructions_text)
-    data_payload = _build_data_payload(student_record, mapping)
-    user_content = json.dumps(data_payload, indent=2, ensure_ascii=False)
+    if question_bank is None:
+        question_bank = build_question_bank(mapping, [student_record])
+    system_content = (
+        _build_system_message(mapping, instructions_text)
+        + "\n\n"
+        + question_bank["text"]
+    )
     return [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": _build_student_payload(student_record, mapping, question_bank)},
     ]
 
 
@@ -337,7 +402,11 @@ def build_advice_messages(student_record, mapping, instructions_text, qa_listing
     }
     return [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": json.dumps(user_payload, indent=2, ensure_ascii=False)},
+        # Compact separators, same reasoning as _build_student_payload: pretty-print
+        # whitespace in a ~40-question listing is thousands of prompt tokens the
+        # model gains nothing from, and prompt evaluation is the dominant cost here.
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False,
+                                                separators=(",", ":"))},
     ]
 
 

@@ -46,3 +46,16 @@ def log_student_generation(batch_id, student_id, timings, attempts, ai_metrics):
     if ai_metrics:
         entry["ai_metrics"] = ai_metrics
     perf_log.info("PERF %s", json.dumps(entry))
+
+
+def log_batch(batch_id, stats, workers):
+    """
+    One line per finished batch: how many students succeeded/failed, total
+    wall-clock, and the worker count that produced it -- so the effect of changing
+    config.REPORT_WORKERS is visible in the logs instead of having to be inferred
+    from per-student timings.
+    """
+    perf_log.info(
+        "PERF %s",
+        json.dumps({"stage": "batch", "batch_id": batch_id, "workers": workers, **stats}),
+    )

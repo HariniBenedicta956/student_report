@@ -1,11 +1,23 @@
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 
 import config
+
+# update_student_status/update_student_progress are read-modify-write against a
+# single manifest file: load the whole thing, change one student's entry, write the
+# whole thing back. With one worker that's fine. With more than one it is not --
+# two workers can load the same manifest, each apply their own student's change to
+# their own copy, and the second write silently discards the first student's update,
+# leaving a finished report showing as "pending" forever. Guarding the whole
+# read-modify-write keeps that safe regardless of config.REPORT_WORKERS. The critical
+# section is a few milliseconds of local file I/O against minutes of generation, so
+# serializing it costs nothing worth measuring.
+_manifest_lock = threading.Lock()
 
 STAGE_LABELS = {
     "prompt_build": "Building prompt",
@@ -84,13 +96,14 @@ def load_manifest(batch_id):
 
 
 def update_student_status(batch_id, student_id, status):
-    manifest = load_manifest(batch_id)
-    for s in manifest["students"]:
-        if s["student_id"] == student_id:
-            s["status"] = status
-            s.pop("current_stage", None)
-            s.pop("stage_started_at", None)
-    save_manifest(batch_id, manifest)
+    with _manifest_lock:
+        manifest = load_manifest(batch_id)
+        for s in manifest["students"]:
+            if s["student_id"] == student_id:
+                s["status"] = status
+                s.pop("current_stage", None)
+                s.pop("stage_started_at", None)
+        save_manifest(batch_id, manifest)
 
 
 def update_student_progress(batch_id, student_id, stage):
@@ -100,12 +113,13 @@ def update_student_progress(batch_id, student_id, stage):
     progress while a report is still generating, instead of only a final summary
     once it's done.
     """
-    manifest = load_manifest(batch_id)
-    for s in manifest["students"]:
-        if s["student_id"] == student_id:
-            s["current_stage"] = stage
-            s["stage_started_at"] = time.time()
-    save_manifest(batch_id, manifest)
+    with _manifest_lock:
+        manifest = load_manifest(batch_id)
+        for s in manifest["students"]:
+            if s["student_id"] == student_id:
+                s["current_stage"] = stage
+                s["stage_started_at"] = time.time()
+        save_manifest(batch_id, manifest)
 
 
 def with_live_progress(manifest):
