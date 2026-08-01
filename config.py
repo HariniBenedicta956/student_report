@@ -43,9 +43,11 @@ OLLAMA_LLAMA3_MODEL = os.environ.get("OLLAMA_LLAMA3_MODEL", "llama3:8b")
 # per-student failure containment, and a single place to raise throughput later
 # -- not because parallel requests are currently faster. Raising this only pays
 # off once the Ollama host can genuinely serve more than one request at a time:
-# a GPU with OLLAMA_NUM_PARALLEL>1, or a second host in OLLAMA_HOSTS. Note that
-# Ollama splits num_ctx across parallel slots, so raising NUM_PARALLEL without
-# also raising the server's context budget can silently truncate our prompt.
+# a GPU with OLLAMA_NUM_PARALLEL>1, or a second host in OLLAMA_HOSTS. Raise this
+# and the server's OLLAMA_NUM_PARALLEL together -- either one alone changes
+# nothing. Each parallel slot carries its own num_ctx worth of KV cache, so the
+# host's VRAM has to grow with it, and each slot caches the shared prompt prefix
+# separately. See GPU_SETUP.md.
 REPORT_WORKERS = int(os.environ.get("REPORT_WORKERS", "1"))
 
 # Keeps the model resident between requests and between batches. Ollama
