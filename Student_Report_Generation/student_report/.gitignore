@@ -1,9 +1,0 @@
-__pycache__/
-*.pyc
-.env
-data/uploads/*
-!data/uploads/.gitkeep
-data/question_banks/*
-!data/question_banks/.gitkeep
-output/batches/*
-!output/batches/.gitkeep
