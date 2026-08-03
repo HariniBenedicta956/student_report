@@ -149,7 +149,20 @@ TONE_RULES = (
 )
 
 
-def _build_system_message(mapping, instructions_text):
+def _build_system_message(mapping, instructions_text, question_bank_text=""):
+    """
+    Order matters here, and not just for readability. The requester's instruction
+    is repeated at the very END of this message on purpose -- a model weights the
+    tail of its prompt most heavily, and burying the instruction mid-message is
+    the difference between it being followed and quietly ignored (observed twice
+    on this project). So the question bank, which is bulk reference material,
+    goes in the middle: after the data description that refers to it, but before
+    the instruction reminder that has to stay last.
+
+    All of this is still byte-identical across students in a batch -- the
+    instruction is batch-level too -- so ordering it this way costs nothing in
+    prefix-cache reuse.
+    """
     is_section_list = bool(instructions_text) and _looks_like_section_list(instructions_text)
     schema_description = (
         _build_custom_schema(_parse_section_list(instructions_text))
@@ -174,6 +187,10 @@ def _build_system_message(mapping, instructions_text):
         "Read every answer against its question in the QUESTION BANK; a question id "
         "missing from \"answers\" means this student left it blank.",
         TONE_RULES,
+    ]
+    if question_bank_text:
+        parts += ["", question_bank_text]
+    parts += [
         "",
         "Extra instructions from the report requester (this is the most important part "
         "of this message -- it overrides the default shape below whenever they conflict):",
@@ -186,7 +203,9 @@ def _build_system_message(mapping, instructions_text):
             "",
             f'REMINDER: the report requester specifically asked for this: '
             f'"{instructions_text}". Follow it even where it means deviating from the '
-            f'default shape above -- their instruction takes priority over the default shape.',
+            f'default shape above -- their instruction takes priority over the default '
+            f'shape, and over the question bank above. If it conflicts with the default '
+            f'fields, the requester wins. Do this before anything else.',
         ]
     parts += ["", "Output ONLY valid JSON. No markdown fences, no commentary."]
     return "\n".join(parts)
@@ -302,10 +321,8 @@ def build_messages(student_record, mapping, instructions_text, question_bank=Non
     """
     if question_bank is None:
         question_bank = build_question_bank(mapping, [student_record])
-    system_content = (
-        _build_system_message(mapping, instructions_text)
-        + "\n\n"
-        + question_bank["text"]
+    system_content = _build_system_message(
+        mapping, instructions_text, question_bank_text=question_bank["text"]
     )
     return [
         {"role": "system", "content": system_content},
