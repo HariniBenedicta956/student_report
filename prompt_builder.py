@@ -90,30 +90,65 @@ def _build_custom_schema(section_names):
     return "\n".join(lines)
 
 
-DEFAULT_SCHEMA_DESCRIPTION = """
-Default output shape (use this unless "Extra instructions from the report requester"
-below clearly ask for something different). This shape is FIXED across every student
-in this batch -- always include every field below with these exact keys, whether or
-not there's much to say for a given student. Do not rename, drop, restructure, or
-merge these fields, and do not replace this shape with a different one on your own
-initiative -- only "Extra instructions from the report requester" below can do that:
+# Used when the requester gave no instruction at all. The absolutism here is
+# deliberate: left to its own judgment the model produced a differently-shaped
+# report for each student in the same batch, which made them incomparable.
+_SCHEMA_PREAMBLE_NO_INSTRUCTIONS = """
+Default output shape. No extra instructions were given, so produce exactly this
+shape. It is FIXED across every student in this batch -- always include every field
+with these exact keys, whether or not there's much to say for a given student. Do
+not rename, drop, restructure or merge them, and do not invent a different shape on
+your own initiative.
+""".strip()
+
+# Used when the requester DID give an instruction. The strict wording above cannot
+# be reused here: it is longer and far more specific than a one-line instruction, so
+# the model resolves the conflict in favour of the schema and quietly ignores the
+# request (observed with "focus on critical and system thinking alone" -- it scored
+# all six sections and wrote about all of them). This version makes the instruction
+# outrank the shape, and spells out the narrowing case explicitly, because an
+# instruction that scopes the report without renaming any field is otherwise not
+# recognised as an override at all.
+_SCHEMA_PREAMBLE_WITH_INSTRUCTIONS = """
+Reference output shape. The report requester's instruction ABOVE outranks everything
+here -- apply that instruction first, and fall back to this shape only for whatever
+the instruction leaves open.
+
+If the instruction NARROWS what the report covers ("focus on X alone", "only cover
+X", "report on X"), then:
+  * put ONLY the section(s) matching X in "section_scores" -- leave every other
+    section out rather than scoring it anyway
+  * write each narrative field about X only, taking the evidence from this student's
+    answers to the X questions
+  * drop any field below that cannot honestly be about X
+Do not cover all six sections anyway for the sake of completeness. A narrower report
+is precisely what was asked for.
+
+If the instruction asks for something structurally different (e.g. "list every
+question and answer, then give the final result alone"), ignore the shape below
+entirely and return only the fields that fulfil the request. Only include a field you
+are filling with real content -- never an empty or placeholder one.
+
+Apply the instruction the same way for every student in this batch, so their reports
+stay comparable to each other.
+""".strip()
+
+_SCHEMA_BODY = """
 {
   "section_scores": {
     "<section key, e.g. B>": {"label": "<section label>", "score": <integer 0-100>}
-    // one entry per section that has questions (always -- section_scores itself is
-    // never optional). You may ADD one or two extra entries here for a genuinely
-    // notable ad-hoc parameter from unmapped_questions -- that's the only part of
-    // this shape that's allowed to vary between students.
+    // one entry per section you are reporting on -- by default every section that
+    // has questions. You may ADD one or two extra entries for a genuinely notable
+    // ad-hoc parameter from the answers.
   },
   // IMPORTANT: every "score" is on a 0-100 scale (0 = lowest maturity, 100 = highest).
   // It is NOT out of 10, NOT out of the number of questions in the section, and NOT a
   // percentile. Judge maturity from the answers themselves and place it on the full
   // 0-100 range -- do not compress your scores into a narrow low band by default.
-  // A section with computed_hint null still MUST get a real numeric score -- that just
-  // means there's no pre-computed number to anchor on, so judge it entirely from how
-  // good/correct the answers to that section's questions were. NEVER set a score to
-  // null, omit it, or skip a section because computed_hint was null.
-  "where_you_stand": "<paragraph reading the pattern across ALL scored bars>",
+  // For a section you ARE reporting, a null computed_hint is not a reason to skip it
+  // or score it null -- it only means there's no pre-computed number to anchor on, so
+  // judge it from how good/correct the answers to that section's questions were.
+  "where_you_stand": "<paragraph reading the pattern across the scored bars>",
   "how_this_shows_up": "<paragraph with 1-2 concrete examples from this student's actual answers>",
   "strengths": ["<evidence-based strength>", ...],
   "where_to_focus_next": ["<framed as opportunity, never a flaw>", ...],
@@ -121,13 +156,6 @@ initiative -- only "Extra instructions from the report requester" below can do t
   "next_steps": ["<3-5 concrete, doable actions>", ...],
   "closing_note": "<short reminder this is a snapshot, not a permanent label>"
 }
-
-If "Extra instructions from the report requester" below ask for something structurally
-different (e.g. "list every question and answer, then give the final result alone"),
-IGNORE the default shape above and return ONLY the JSON fields that fulfill that
-request (for example {"qa_listing": [{"question": "...", "answer": "..."}],
-"final_result": "..."}). Only include a field if you are actually filling it with real
-content -- never include an empty or placeholder field.
 
 If asked to list questions and answers (all of them, or a filtered subset like "just
 the wrong ones"), you MUST go through every single entry in the user message's
@@ -141,6 +169,14 @@ Steps]"). A list of section names is just as authoritative as a sentence -- it m
 "produce exactly these sections, in this order, each with real written content", not
 decoration to ignore.
 """.strip()
+
+
+def _schema_description(instructions_text):
+    preamble = (
+        _SCHEMA_PREAMBLE_WITH_INSTRUCTIONS if instructions_text
+        else _SCHEMA_PREAMBLE_NO_INSTRUCTIONS
+    )
+    return preamble + "\n" + _SCHEMA_BODY
 
 TONE_RULES = (
     "Always write in encouraging, non-comparative language. Never describe the student "
@@ -167,7 +203,7 @@ def _build_system_message(mapping, instructions_text, question_bank_text=""):
     schema_description = (
         _build_custom_schema(_parse_section_list(instructions_text))
         if is_section_list
-        else DEFAULT_SCHEMA_DESCRIPTION
+        else _schema_description(instructions_text)
     )
 
     parts = [
