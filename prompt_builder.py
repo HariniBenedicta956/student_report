@@ -148,6 +148,11 @@ _SCHEMA_BODY = """
   // For a section you ARE reporting, a null computed_hint is not a reason to skip it
   // or score it null -- it only means there's no pre-computed number to anchor on, so
   // judge it from how good/correct the answers to that section's questions were.
+  // A section is either IN this report or OUT of it. IN means a real 0-100 number.
+  // OUT means its key is absent from section_scores altogether -- that is how you
+  // exclude a section the requester's instruction says not to cover. NEVER write
+  // null, "N/A" or an empty string: that is neither, and it renders as a blank
+  // missing bar that tells the student nothing.
   "where_you_stand": "<paragraph reading the pattern across the scored bars>",
   "how_this_shows_up": "<paragraph with 1-2 concrete examples from this student's actual answers>",
   "strengths": ["<evidence-based strength>", ...],
