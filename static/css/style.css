@@ -260,6 +260,20 @@ td.action-cell {
 .perf-summary .stat { color: var(--text-secondary); }
 .perf-summary .stat b { color: var(--text-primary); font-weight: 600; }
 
+.gpu-badge {
+  display: inline-block;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 0.5px solid var(--border);
+  background: var(--surface, #F7F7F6);
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin-bottom: 16px;
+}
+.gpu-badge b { color: var(--text-primary); font-weight: 600; }
+.gpu-badge.on-gpu { border-color: var(--teal); background: #EFFAF6; }
+.gpu-badge.on-cpu { border-color: var(--amber); background: #FFF6EC; }
+
 .error-banner {
   background: #FFF6EC;
   border: 0.5px solid var(--amber);

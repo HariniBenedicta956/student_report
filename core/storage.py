@@ -106,19 +106,29 @@ def update_student_status(batch_id, student_id, status):
         save_manifest(batch_id, manifest)
 
 
-def update_student_progress(batch_id, student_id, stage):
+def update_student_progress(batch_id, student_id, stage, note=None, restart_clock=True):
     """
     Marks which pipeline stage a student's generation is currently in, with a wall-
     clock start time -- lets Screen 2 show live "currently: AI call, 42s elapsed"
     progress while a report is still generating, instead of only a final summary
     once it's done.
+
+    note appends detail to the stage label (e.g. "retry 3 - unreachable"), so a stalled
+    student reads as retrying rather than as silently hung. restart_clock=False keeps
+    the original stage_started_at, so the elapsed time shown covers the whole stage
+    including its retries rather than resetting on each one.
     """
     with _manifest_lock:
         manifest = load_manifest(batch_id)
         for s in manifest["students"]:
             if s["student_id"] == student_id:
                 s["current_stage"] = stage
-                s["stage_started_at"] = time.time()
+                if restart_clock or not s.get("stage_started_at"):
+                    s["stage_started_at"] = time.time()
+                if note:
+                    s["stage_note"] = note
+                else:
+                    s.pop("stage_note", None)
         save_manifest(batch_id, manifest)
 
 
@@ -127,7 +137,10 @@ def with_live_progress(manifest):
     now = time.time()
     for s in manifest["students"]:
         if s.get("status") == "pending" and s.get("stage_started_at"):
-            s["current_stage_label"] = STAGE_LABELS.get(s["current_stage"], s["current_stage"])
+            label = STAGE_LABELS.get(s["current_stage"], s["current_stage"])
+            if s.get("stage_note"):
+                label = f"{label} ({s['stage_note']})"
+            s["current_stage_label"] = label
             s["stage_elapsed_s"] = round(now - s["stage_started_at"], 1)
     return manifest
 

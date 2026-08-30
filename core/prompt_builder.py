@@ -1,187 +1,107 @@
 import json
-import re
 
-from scoring import compute_section_hints
+import config
+from core.scoring import compute_section_hints
 
-# Existing fields that already have special handling elsewhere (pdf_generator draws a
-# real bar chart for "section_scores", the PDF header already prints name/branch/year/
-# institution). When a requester lists section names, map obvious matches onto these
-# instead of minting a new custom key, so the AI's output actually gets that treatment.
-_FIELD_ALIASES = [
-    (("score", "chart"), "section_scores"),
-    (("strength",), "strengths"),
-    (("improvement", "weakness", "growth", "focus next", "focus area"), "where_to_focus_next"),
-    (("next step", "recommendation", "action plan"), "next_steps"),
-    (("interest",), "interest_zone"),
-    (("closing", "disclaimer"), "closing_note"),
-    (("overall", "summary", "insight", "where you stand", "performance"), "where_you_stand"),
-    (("shows up", "evidence", "specific example"), "how_this_shows_up"),
-]
-# Already covered by the PDF's static title/header (name, branch, year, institution) --
-# not something the AI should be asked to generate.
-_SKIP_PHRASES = ("cover", "student detail", "report date")
+# NOTE: there used to be a "section list" branch here -- a heuristic that decided an
+# instruction containing two or more commas was a list of section NAMES, and built a
+# JSON schema with one field per comma-separated phrase. It misfired on ordinary
+# prose: "focus on career guidelines, critical thinking, system thinking and make
+# sure the ui interface is good" became the fields focus_on_career_guidelines,
+# critical_thinking and system_thinking_and_make_sure_the_ui_interface_is_good. The
+# requester's sentence was turned into headings instead of being followed. It is
+# deleted rather than tightened -- the instruction now outranks the schema directly
+# (see _SCHEMA_INSTRUCTION_LED), so nothing needs to guess at the shape of the
+# request in the first place.
 
 
-def _looks_like_section_list(text):
-    """True for '[A, B, C]' or 'A, B, C' -- a list of short labels, not a sentence."""
-    text = text.strip()
-    if text.startswith("[") and text.endswith("]"):
-        text = text[1:-1]
-    if text.count(",") < 2:
-        return False
-    parts = [p.strip() for p in text.split(",")]
-    return all(0 < len(p) < 60 for p in parts) and not any(p.endswith(".") for p in parts[:-1])
+# The four tier labels the Personal Learning Growth Report template renders as
+# coloured pills. A fixed, closed set -- the PDF has a colour per tier and nothing
+# to draw for a value outside it, so anything else is a validation failure rather
+# than something to render loosely.
+TIERS = ("Strength", "Developing", "Focus Required", "Blind Spot")
 
+# The report shape the PDF template actually renders. This is deliberately a fixed
+# schema again: the template has named, laid-out regions (profile dimensions with
+# tier pills, strength cards, focus cards with a "Try this" action, blind-spot
+# cards, one dark priority panel), so the model cannot invent its own fields
+# without producing something the template has nowhere to put.
+#
+# Note it is entirely QUALITATIVE -- tiers, not numbers. The template says so
+# explicitly ("qualitative bands, not numeric or percentile"), so there is no
+# 0-100 score anywhere in this schema.
+_SCHEMA_REPORT = """
+Output EXACTLY this JSON shape. Every field is required. The PDF template has a
+fixed place for each one, so a missing or renamed field leaves a hole in the report.
 
-def _parse_section_list(text):
-    text = text.strip()
-    if text.startswith("[") and text.endswith("]"):
-        text = text[1:-1]
-    return [p.strip() for p in text.split(",") if p.strip()]
-
-
-def _slugify_section_name(name):
-    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-    return slug or "section"
-
-
-def _map_section_name(name):
-    lower = name.lower()
-    if any(p in lower for p in _SKIP_PHRASES):
-        return None
-    for keywords, field in _FIELD_ALIASES:
-        if any(k in lower for k in keywords):
-            return field
-    return _slugify_section_name(name)
-
-
-def _build_custom_schema(section_names):
-    lines = [
-        "The report requester listed the exact sections to include, in this order:",
-        ", ".join(section_names),
-        "",
-        "Output a JSON object with one field per section below (skipping any noted as "
-        "already covered). Fill each with real generated content -- a paragraph or a "
-        'bulleted list of strings, except "section_scores" which uses the normal '
-        '{"<key>": {"label": ..., "score": <0-100 integer>}} shape covering all sections '
-        "B-G. Never leave a field empty or use placeholder text.",
-        "{",
-    ]
-    seen_keys = set()
-    for name in section_names:
-        key = _map_section_name(name)
-        if key is None:
-            lines.append(f'  // "{name}" -- already covered by the PDF header, skip this one')
-            continue
-        if key in seen_keys:
-            # Two different requested sections both aliased to the same known field
-            # (e.g. "Overall Performance Summary" and "Personalized Insights" both look
-            # like "where_you_stand") -- fall back to a name-derived key so the second
-            # one is still generated instead of silently dropped, just without the
-            # special rendering treatment the alias would have given it.
-            base = _slugify_section_name(name)
-            key, suffix = base, 2
-            while key in seen_keys:
-                key = f"{base}_{suffix}"
-                suffix += 1
-        seen_keys.add(key)
-        lines.append(f'  "{key}": <content for "{name}">,')
-    lines.append("}")
-    return "\n".join(lines)
-
-
-# Used when the requester gave no instruction at all. The absolutism here is
-# deliberate: left to its own judgment the model produced a differently-shaped
-# report for each student in the same batch, which made them incomparable.
-_SCHEMA_PREAMBLE_NO_INSTRUCTIONS = """
-Default output shape. No extra instructions were given, so produce exactly this
-shape. It is FIXED across every student in this batch -- always include every field
-with these exact keys, whether or not there's much to say for a given student. Do
-not rename, drop, restructure or merge them, and do not invent a different shape on
-your own initiative.
-""".strip()
-
-# Used when the requester DID give an instruction. The strict wording above cannot
-# be reused here: it is longer and far more specific than a one-line instruction, so
-# the model resolves the conflict in favour of the schema and quietly ignores the
-# request (observed with "focus on critical and system thinking alone" -- it scored
-# all six sections and wrote about all of them). This version makes the instruction
-# outrank the shape, and spells out the narrowing case explicitly, because an
-# instruction that scopes the report without renaming any field is otherwise not
-# recognised as an override at all.
-_SCHEMA_PREAMBLE_WITH_INSTRUCTIONS = """
-Reference output shape. The report requester's instruction ABOVE outranks everything
-here -- apply that instruction first, and fall back to this shape only for whatever
-the instruction leaves open.
-
-If the instruction NARROWS what the report covers ("focus on X alone", "only cover
-X", "report on X"), then:
-  * put ONLY the section(s) matching X in "section_scores" -- leave every other
-    section out rather than scoring it anyway
-  * write each narrative field about X only, taking the evidence from this student's
-    answers to the X questions
-  * drop any field below that cannot honestly be about X
-Do not cover all six sections anyway for the sake of completeness. A narrower report
-is precisely what was asked for.
-
-If the instruction asks for something structurally different (e.g. "list every
-question and answer, then give the final result alone"), ignore the shape below
-entirely and return only the fields that fulfil the request. Only include a field you
-are filling with real content -- never an empty or placeholder one.
-
-Apply the instruction the same way for every student in this batch, so their reports
-stay comparable to each other.
-""".strip()
-
-_SCHEMA_BODY = """
 {
-  "section_scores": {
-    "<section key, e.g. B>": {"label": "<section label>", "score": <integer 0-100>}
-    // one entry per section you are reporting on -- by default every section that
-    // has questions. You may ADD one or two extra entries for a genuinely notable
-    // ad-hoc parameter from the answers.
-  },
-  // IMPORTANT: every "score" is on a 0-100 scale (0 = lowest maturity, 100 = highest).
-  // It is NOT out of 10, NOT out of the number of questions in the section, and NOT a
-  // percentile. Judge maturity from the answers themselves and place it on the full
-  // 0-100 range -- do not compress your scores into a narrow low band by default.
-  // For a section you ARE reporting, a null computed_hint is not a reason to skip it
-  // or score it null -- it only means there's no pre-computed number to anchor on, so
-  // judge it from how good/correct the answers to that section's questions were.
-  // A section is either IN this report or OUT of it. IN means a real 0-100 number.
-  // OUT means its key is absent from section_scores altogether -- that is how you
-  // exclude a section the requester's instruction says not to cover. NEVER write
-  // null, "N/A" or an empty string: that is neither, and it renders as a blank
-  // missing bar that tells the student nothing.
-  "where_you_stand": "<paragraph reading the pattern across the scored bars>",
-  "how_this_shows_up": "<paragraph with 1-2 concrete examples from this student's actual answers>",
-  "strengths": ["<evidence-based strength>", ...],
-  "where_to_focus_next": ["<framed as opportunity, never a flaw>", ...],
-  "interest_zone": "<what the pattern of answers suggests they're drawn toward>",
-  "next_steps": ["<3-5 concrete, doable actions>", ...],
-  "closing_note": "<short reminder this is a snapshot, not a permanent label>"
+  "intro_message": "<2-3 sentences addressed to the student BY NAME, framing what
+                     this report is. Warm, specific to them, not generic.>",
+
+  "dimensions": [
+    {
+      "name": "<short dimension name, 2-4 words, e.g. 'Learning Consistency'>",
+      "description": "<ONE sentence, evidence-based, pointing at what their own
+                       answers actually showed. Not advice -- an observation.>",
+      "tier": "<exactly one of: Strength | Developing | Focus Required | Blind Spot>"
+    }
+    // one per dimension you judge from the answers -- aim for 5-7, ordered
+    // strongest first. Cover the range of the question bank rather than
+    // clustering on one theme.
+  ],
+
+  "strong": [
+    {"headline": "<short phrase naming the pattern>",
+     "body": "<1-2 sentences on how this shows up in their answers>"}
+    // their strongest patterns -- 2-3 entries
+  ],
+
+  "focus": [
+    {"headline": "<short phrase naming what to work on>",
+     "body": "<1-2 sentences, framed as opportunity, never as a flaw>",
+     "action": "<one concrete thing they could actually do this week>"}
+    // where focus pays off most -- 2-3 entries
+  ],
+
+  "blindspot": [
+    {"headline": "<short phrase naming the mismatch>",
+     "body": "<1-2 sentences on where what they believe and what they do differ>",
+     "action": "<one concrete thing they could actually do this week>"}
+    // belief vs behaviour -- 1-2 entries. Only include a blind spot the answers
+    // genuinely evidence; an empty-handed guess here is worse than none.
+  ],
+
+  "single_priority": {
+    "headline": "<the ONE thing to focus on for the bootcamp>",
+    "body": "<1-2 sentences on why this one, ahead of everything else>"
+  }
 }
 
-If asked to list questions and answers (all of them, or a filtered subset like "just
-the wrong ones"), you MUST go through every single entry in the user message's
-"answers" object and include EVERY one that matches the request -- do not sample,
-summarize, or stop after a handful. There are roughly 90 answers; a short list is very
-likely an incomplete one.
+Rules that matter:
+  * "tier" must be one of the four labels exactly as spelled above. Any other value
+    cannot be rendered.
+  * This report is qualitative. Do NOT invent numeric scores, percentages,
+    percentiles or ratings anywhere -- the template deliberately has no place for
+    them and they read as precision the answers do not support.
+  * Every claim must be traceable to this student's actual answers. Do not assert
+    experience, projects, internships or achievements they did not report.
+  * "action" fields must be doable in a week, not a career plan.
+  * Never emit an empty string, an empty array, a placeholder, or a field left as
+    the description above.
+""".strip()
 
-Instructions may be phrased as a sentence, OR as a plain list of section names
-(comma-separated, or wrapped in brackets like "[Cover Page, Key Strengths, Next
-Steps]"). A list of section names is just as authoritative as a sentence -- it means
-"produce exactly these sections, in this order, each with real written content", not
-decoration to ignore.
+_SCHEMA_INSTRUCTION_NOTE = """
+The report requester's instruction ABOVE steers the CONTENT of these fields -- what
+to emphasise, which dimensions to pick, the tone and depth of the writing. It does
+not change the SHAPE: the template renders these fields and no others, so produce
+every field above regardless, with the instruction applied to what goes in them.
 """.strip()
 
 
 def _schema_description(instructions_text):
-    preamble = (
-        _SCHEMA_PREAMBLE_WITH_INSTRUCTIONS if instructions_text
-        else _SCHEMA_PREAMBLE_NO_INSTRUCTIONS
-    )
-    return preamble + "\n" + _SCHEMA_BODY
+    if instructions_text:
+        return _SCHEMA_REPORT + "\n\n" + _SCHEMA_INSTRUCTION_NOTE
+    return _SCHEMA_REPORT
 
 TONE_RULES = (
     "Always write in encouraging, non-comparative language. Never describe the student "
@@ -204,12 +124,7 @@ def _build_system_message(mapping, instructions_text, question_bank_text=""):
     instruction is batch-level too -- so ordering it this way costs nothing in
     prefix-cache reuse.
     """
-    is_section_list = bool(instructions_text) and _looks_like_section_list(instructions_text)
-    schema_description = (
-        _build_custom_schema(_parse_section_list(instructions_text))
-        if is_section_list
-        else _schema_description(instructions_text)
-    )
+    schema_description = _schema_description(instructions_text)
 
     parts = [
         "You are writing a personalized career-readiness report for one student.",
@@ -234,19 +149,24 @@ def _build_system_message(mapping, instructions_text, question_bank_text=""):
     parts += [
         "",
         "Extra instructions from the report requester (this is the most important part "
-        "of this message -- it overrides the default shape below whenever they conflict):",
-        instructions_text or "(none given -- use the default report shape)",
+        "of this message for CONTENT -- what to emphasise, which dimensions to pick, "
+        "tone and depth. The report template below is fixed and takes priority over "
+        "this instruction whenever the two would conflict on SHAPE: never add, drop, "
+        "or rename a field because of what is asked here.):",
+        instructions_text or "(none given)",
         "",
         schema_description,
     ]
-    if instructions_text and not is_section_list:
+    if instructions_text:
         parts += [
             "",
-            f'REMINDER: the report requester specifically asked for this: '
-            f'"{instructions_text}". Follow it even where it means deviating from the '
-            f'default shape above -- their instruction takes priority over the default '
-            f'shape, and over the question bank above. If it conflicts with the default '
-            f'fields, the requester wins. Do this before anything else.',
+            f'REMINDER: the report requester asked for exactly this: '
+            f'"{instructions_text}". Apply it to the CONTENT of every field in the '
+            f'template above -- what you emphasise, which dimensions you pick, tone '
+            f'and depth. Still output every field the template defines, exactly as '
+            f'shaped, and no additional or renamed fields. Do not fall back to '
+            f'generic, unspecific content -- ground everything in this request and '
+            f'this student\'s own answers.',
         ]
     parts += ["", "Output ONLY valid JSON. No markdown fences, no commentary."]
     return "\n".join(parts)
@@ -469,21 +389,50 @@ def build_advice_messages(student_record, mapping, instructions_text, qa_listing
 
 
 def build_fallback_report(student_record, mapping):
-    """Minimal templated report used when the AI never returns valid JSON."""
+    """
+    Last-resort templated report, used only after the retry budget in
+    ollama_client is fully exhausted -- i.e. the host stayed unreachable or kept
+    returning unparseable output for the whole window, not on a single failure.
+
+    The dimension tiers here are derived in Python from the computed section hints,
+    so they are real even though the written narrative could not be generated. The
+    banding matches how the template reads: the report is qualitative, so a hint is
+    turned into a tier rather than shown as a number.
+    """
     sections = student_record["sections"]
     hints = compute_section_hints(sections)
-    section_scores = {}
+    name = (student_record["identity"].get("name") or "there").split()[0]
+
+    dimensions = []
     for section_key, section_cfg in mapping["sections"].items():
         hint = hints.get(section_key)
-        section_scores[section_key] = {
-            "label": section_cfg.get("label", section_key),
-            "score": round(hint) if hint is not None else 0,
-        }
+        if hint is None:
+            tier = "Developing"
+        elif hint >= 75:
+            tier = "Strength"
+        elif hint >= config.SCORE_PASS_THRESHOLD:
+            tier = "Developing"
+        else:
+            tier = "Focus Required"
+        dimensions.append({
+            "name": section_cfg.get("label", section_key),
+            "description": "Derived directly from your answers in this area.",
+            "tier": tier,
+        })
+
     return {
-        "section_scores": section_scores,
-        "where_you_stand": (
-            "We weren't able to generate a full narrative for this report right now. "
-            "The scores above are computed directly from your answers."
+        "intro_message": (
+            f"{name}, we weren't able to generate the full written commentary for "
+            "this report right now. The profile below is derived directly from the "
+            "answers you gave, so it still reflects your own responses."
         ),
-        "closing_note": "This is a snapshot from one assessment, not a permanent label.",
+        "dimensions": dimensions,
+        # strong/focus/blindspot are omitted rather than sent as empty arrays --
+        # the written cards genuinely could not be produced, and an absent field
+        # renders as "no section" while an empty one reads as a bug.
+        "single_priority": {
+            "headline": "Review this report with your mentor",
+            "body": ("The written sections could not be generated on this run. Your "
+                      "profile above is accurate; the commentary is worth revisiting."),
+        },
     }

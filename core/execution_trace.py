@@ -63,6 +63,20 @@ def set_step(trace, step, status, code="", input_data=None, output_data=None,
     trace[step] = entry
 
 
+def update_step_extra(trace, step, **fields):
+    """
+    Merges fields into a step's "extra" without touching its status or started_at.
+
+    Used for live retry reporting: set_step(status="running") would stamp a fresh
+    started_at on every retry, so the dashboard's elapsed counter would reset to
+    zero each time and hide how long the step has really been stuck.
+    """
+    entry = trace.get(step)
+    if entry is None:
+        return
+    entry.setdefault("extra", {}).update(fields)
+
+
 def with_live_elapsed(trace):
     """
     For any step still "running" when the trace is served, adds a live elapsed_s

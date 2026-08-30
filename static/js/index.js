@@ -135,9 +135,39 @@ async function handleQbankFile(file) {
   }
 }
 
+// Ollama falls back to CPU silently -- it does not error, it just runs many times
+// slower. So the badge reports what the host is actually doing, refreshed before
+// each run rather than only once at page load.
+const gpuBadge = document.getElementById("gpu-badge");
+const gpuBadgeText = document.getElementById("gpu-badge-text");
+
+async function refreshGpuBadge() {
+  try {
+    const res = await fetch("/gpu-status");
+    const s = await res.json();
+    gpuBadge.classList.remove("on-gpu", "on-cpu");
+    if (s.on_gpu === true) {
+      gpuBadgeText.textContent = `${s.processor} ✅`;
+      gpuBadge.classList.add("on-gpu");
+    } else if (s.on_gpu === false) {
+      gpuBadgeText.textContent = `${s.processor} ⚠️`;
+      gpuBadge.classList.add("on-cpu");
+    } else {
+      gpuBadgeText.textContent = s.reachable ? "unknown — no model loaded yet" : "host unreachable ⚠️";
+      if (!s.reachable) gpuBadge.classList.add("on-cpu");
+    }
+    gpuBadge.title = s.detail || "";
+  } catch (err) {
+    gpuBadgeText.textContent = "unavailable";
+  }
+}
+
+refreshGpuBadge();
+
 generateBtn.addEventListener("click", async () => {
   if (!uploadId) return;
   clearError();
+  refreshGpuBadge();
 
   const selectedIndices = Array.from(checklist.querySelectorAll("input[type=checkbox]:checked"))
     .map((cb) => parseInt(cb.dataset.index, 10));

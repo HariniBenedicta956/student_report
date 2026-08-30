@@ -147,10 +147,13 @@ Three independent checks. Do all three — the first is the authoritative one.
 ```bash
 # load the model, then ask where it lives
 curl -s http://192.168.68.58:11434/api/generate \
-  -d '{"model":"hermes3:8b","prompt":"hi","stream":false,"keep_alive":"30m"}' > /dev/null
+  -d '{"model":"qwen3.5:4b","prompt":"hi","stream":false,"keep_alive":"30m"}' > /dev/null
 
 curl -s http://192.168.68.58:11434/api/ps
 ```
+
+Use whichever model the app is actually set to (`MODEL_SELECTION` in `.env`) —
+checking one model tells you nothing about where a different one is running.
 
 - `"size_vram": 0` → **still on CPU.** Nothing below matters until this changes.
 - `"size_vram"` ≈ `"size"` → fully on GPU. This is what you want.
@@ -162,14 +165,16 @@ curl -s http://192.168.68.58:11434/api/ps
 
 ```bash
 curl -s http://192.168.68.58:11434/api/generate -d '{
-  "model":"hermes3:8b",
+  "model":"qwen3.5:4b",
   "prompt":"Write three sentences about cloud computing.",
   "stream":false, "keep_alive":"30m"
 }' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(round(d["eval_count"]/(d["eval_duration"]/1e9),1), "tok/s")'
 ```
 
-~4 tok/s means you are still on CPU. An 8B Q4_0 model on a current NVIDIA card
-should land in the tens of tok/s or better.
+~4 tok/s is the CPU figure measured here for an 8B Q4_0 model. A 4B model is
+smaller and will be somewhat faster on CPU too, so judge by the jump when the
+GPU comes on rather than by an absolute number: on a current NVIDIA card expect
+tens of tok/s or better.
 
 **c. Watch VRAM during a call:**
 
@@ -194,6 +199,12 @@ Measured from this host's own `/api/ps` and `/api/tags`:
 
 So an **8 GB** card fits one slot comfortably. A 12 GB card fits two, 24 GB
 fits four or more.
+
+These numbers are for `hermes3:8b`, which is what they were measured on. The
+active model is now `qwen3.5:4b` — roughly half the parameters, so its weights
+and KV cache both cost less and more parallel slots fit in the same VRAM. Read
+the real figures off `/api/ps` (`size` and `size_vram`) once it is loaded rather
+than scaling these by eye.
 
 If you are short on VRAM, in order of preference:
 

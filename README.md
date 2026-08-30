@@ -1,7 +1,33 @@
 # Career Readiness Report Generator
 
 Turns a CSV of survey answers into a personalized, AI-written PDF report per
-student. See `project_requirement .md` for the full spec.
+student. See `docs/project_requirement.md` for the full spec.
+
+## Project layout
+
+```
+app.py                    entry point -- routes, request handling, orchestration
+config.py                 env vars, paths, feature knobs (stays at root: paths
+                           inside it are resolved relative to its own location)
+section_mapping.json       real config -- CSV columns -> sections (see below)
+section_mapping.example.json  template to copy from for a new survey
+
+core/                      backend logic, imported by app.py
+  csv_ingest.py              CSV -> structured student records
+  scoring.py                 computed 0-100 section hints
+  prompt_builder.py          builds the Ollama messages + output schema
+  ollama_client.py           HTTP calls to Ollama, retry/backoff, capacity probing
+  report_queue.py            priority queue + dynamic worker pool
+  pdf_generator.py           renders the final PDF
+  storage.py                 batch/manifest/report/trace persistence
+  execution_trace.py         per-step data for the Execution Dashboard
+  perf_logging.py            structured PERF log lines
+
+static/, templates/        Screen 1/2 + dashboard frontend (served by Flask)
+data/, output/              runtime data -- uploads and generated reports
+                            (gitignored; not part of the source layout)
+docs/                       reference docs (spec, architecture, GPU setup, question bank)
+```
 
 ## Setup
 
@@ -13,21 +39,30 @@ pip install -r requirements.txt
 local Ollama install needed):
 
 ```
-OLLAMA_NETWORK=auto
+NETWORK_MODE=auto
+MODEL_SELECTION=qwen
 OLLAMA_LAN_URL=http://192.168.68.58:11434
 OLLAMA_WG_URL=http://10.0.0.3:11434
+OLLAMA_QWEN3_MODEL=qwen3.5:4b
 OLLAMA_HERMES3_MODEL=hermes3:8b
 ```
 
-`OLLAMA_NETWORK` picks which host(s) to call:
+`NETWORK_MODE` picks which host(s) to call:
 - `lan` — only the LAN host
 - `wg` — only the WireGuard host (works off the LAN)
 - `auto` (default) — tries LAN first, falls back to WireGuard if it's down
 
+`MODEL_SELECTION` picks the model:
+- `qwen` (default) — `qwen3.5:4b`, which also runs both roles in the validation
+  study (see `validation.md`)
+- `hermes` — `hermes3:8b`; not called at present, kept so switching back is one line
+
+See `.env.example` for the full set of knobs (workers, retries, context size).
+
 ## Before the first upload: fill in `section_mapping.json`
 
 The system maps CSV columns to the six sections (B–G) through a config
-file, never through hardcoded column positions (project_requirement.md §5).
+file, never through hardcoded column positions (docs/project_requirement.md §5).
 
 1. Copy `section_mapping.example.json` to `section_mapping.json`.
 2. For each identity field (name, roll number, institution, branch, year),
@@ -46,13 +81,13 @@ file, never through hardcoded column positions (project_requirement.md §5).
    returning section scores out of ~10 instead of 0–100.
 
 `section_mapping.json` currently reflects the real i45G career-readiness
-diagnostic, built from `UIT.md` (the full question bank) cross-referenced
+diagnostic, built from `docs/UIT.md` (the full question bank) cross-referenced
 against the actual CSV export's `Qn` numbering:
 - Q8–Q47 grouped into sections B–G (see the `_excluded`/`_ordinal_design`
   notes in the file for what's left out and why).
 - Sections B–E have full `options_low_to_high` lists where the question is a
   genuine self-report maturity gradient; a few individual questions and all
-  of sections F–G are scenario/best-answer questions (UIT.md itself says to
+  of sections F–G are scenario/best-answer questions (docs/UIT.md itself says to
   randomise their option order and hide the correct answer — i.e. one right
   answer plus distractors, not a scale), so those are left fully AI-judged
   instead of force-ranked.
@@ -71,7 +106,7 @@ not the *complete* set of options each question offers, which is what
 To rebuild it properly, provide both:
 1. **The full question bank** — the actual form/questions doc listing every
    question, its type (select one / select up to N / select all), and its
-   complete list of answer options (like `UIT.md` this time). This is what
+   complete list of answer options (like `docs/UIT.md` this time). This is what
    makes correct low→high ordering and multi-select flags possible.
 2. **A CSV export sample** (even a few rows) — so the exact column headers
    and `Qn`-style numbering used by *that* export can be matched up against
@@ -98,19 +133,20 @@ Open http://localhost:5000
    *Generate reports*.
 2. Backend parses the CSV against `section_mapping.json`, computes a
    preliminary 0–100 score per section from single-choice answers
-   (`scoring.py`), and builds one compact prompt per student
-   (`prompt_builder.py`) combining their raw answers + the instruction text.
-3. Each prompt goes to Hermes-3-8B via Ollama (`ollama_client.py`), which
-   returns JSON (section scores, narrative, strengths, etc.). Invalid JSON
-   is retried once with a stricter reminder, then falls back to a minimal
-   computed-only report (`prompt_builder.build_fallback_report`).
-4. `pdf_generator.py` renders **only whatever fields are present** in that
+   (`core/scoring.py`), and builds one compact prompt per student
+   (`core/prompt_builder.py`) combining their raw answers + the instruction text.
+3. Each prompt goes to `qwen3.5:4b` via Ollama (`core/ollama_client.py`), which
+   returns JSON (section scores, narrative, strengths, etc.). Invalid JSON or an
+   unreachable host is retried with backoff by `core/report_queue.py`, which
+   requeues the student to the back of the queue rather than blocking the ones
+   behind it.
+4. `core/pdf_generator.py` renders **only whatever fields are present** in that
    JSON — bar chart only if `section_scores` is present, strengths heading
    only if `strengths` is present, etc. — so an instruction like "just list
    every question and answer" produces a completely different, shorter PDF
    with no bars forced in.
 5. Both the JSON and PDF are saved to disk under
-   `output/batches/<batch_id>/` (`storage.py`).
+   `output/batches/<batch_id>/` (`core/storage.py`).
 6. **Screen 2** (`/batch/<batch_id>`) lists students with status, and lets
    you Explore (view JSON), View (PDF preview), Download one, Download all
    (each PDF individually), or Download as zip.
