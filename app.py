@@ -13,6 +13,7 @@ from werkzeug.utils import secure_filename
 import config
 from core import csv_ingest
 from core import execution_trace
+from core import hermes_agent_client
 from core import ollama_client
 from core import pdf_generator
 from core import perf_logging
@@ -345,6 +346,7 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
     storage.update_student_progress(batch_id, student_id, "ai_call")
     selected_model = config.get_active_ollama_model()
     hermes_request_info = {
+        "hermes_agent_endpoint": config.HERMES_AGENT_URL,
         "hosts_tried_in_order": list(ctx.hosts) if ctx else config.get_active_hosts(),
         "model": selected_model,
         "message_count": len(messages),
@@ -365,7 +367,7 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
             "failed_stage": execution_trace.STEP_LABELS["send_to_hermes"],
         }
     execution_trace.set_step(trace, "send_to_hermes", "running",
-                              code=execution_trace.get_code(ollama_client, "_call_host"),
+                              code=execution_trace.get_code(hermes_agent_client, "generate_json"),
                               input_data=hermes_request_info,
                               extra=prior_failure)
     execution_trace.set_step(trace, "ai_processing", "running",
@@ -403,7 +405,7 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
     t_stage = time.perf_counter()
     try:
         with perf_logging.timed(timings, "ai_call_s"):
-            result = ollama_client.generate_json(
+            result = hermes_agent_client.generate_json(
                 messages,
                 model=selected_model,
                 on_retry=_on_retry,
@@ -422,7 +424,7 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
         error_type = getattr(exc, "error_type", "unreachable")
         execution_trace.set_step(
             trace, "send_to_hermes", "error",
-            code=execution_trace.get_code(ollama_client, "_call_host"),
+            code=execution_trace.get_code(hermes_agent_client, "generate_json"),
             input_data=hermes_request_info,
             output_data={"error": str(exc)},
             extra={"last_error_type": error_type,
@@ -446,7 +448,7 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
         retry_summary.update(prior_failure)
     execution_trace.set_step(
         trace, "send_to_hermes", "done" if host_used else "error",
-        code=execution_trace.get_code(ollama_client, "_call_host"),
+        code=execution_trace.get_code(hermes_agent_client, "generate_json"),
         input_data=hermes_request_info,
         output_data={"host_used": host_used} if host_used else {"error": failure_reason},
         # Carries the retry history forward onto the finished step, so the dashboard
@@ -713,104 +715,20 @@ STUDY_MIN_HEADLINE_CHARS = 8
 
 
 # --- GPU / CPU verification ------------------------------------------------
-
-def study_gpu_status(hosts=None, timeout=(3, 5)):
-    """
-    The equivalent of `ollama ps`'s PROCESSOR column, read over HTTP so it works
-    against the remote host instead of only on the box itself.
-
-    `ollama ps` derives PROCESSOR from the same numbers /api/ps returns: weights
-    entirely in VRAM show "100% GPU", none in VRAM shows "100% CPU", and a
-    partial offload shows the split. size_vram is the authoritative signal --
-    Ollama falls back to CPU silently, so a host counts as GPU only when it
-    actually reports weights resident in VRAM.
-
-    Never raises: an unreachable host is a result worth logging, not an
-    exception that should abort a run. Returns processor=None when nothing is
-    loaded, because with no resident model there is genuinely nothing to read --
-    that is unknown, not CPU.
-    """
-    last_error = last_host = None
-    for host in (hosts or config.get_active_hosts()):
-        try:
-            resp = requests.get(f"{host}/api/ps", timeout=timeout)
-            resp.raise_for_status()
-            models = resp.json().get("models", [])
-        except (requests.ConnectionError, requests.Timeout, requests.HTTPError,
-                ValueError) as exc:
-            # Fall through to the next host rather than reporting the first
-            # failure as the answer. OLLAMA_HOSTS is a failover chain, so with
-            # the LAN address down but WireGuard up, returning here would show
-            # the host as dead while generation was in fact working fine.
-            last_error, last_host = exc, host
-            continue
-        if not models:
-            return {"host": host, "reachable": True, "processor": None, "on_gpu": None,
-                    "detail": "no model resident -- run a generation first"}
-        model = models[0]
-        size = model.get("size") or 0
-        vram = model.get("size_vram") or 0
-        pct = round(100 * vram / size) if size else 0
-        if pct >= 99:
-            processor = "100% GPU"
-        elif pct <= 0:
-            processor = "100% CPU"
-        else:
-            processor = f"{pct}% GPU / {100 - pct}% CPU"
-        return {"host": host, "reachable": True, "processor": processor,
-                "on_gpu": vram > 0, "model": model.get("name"),
-                "size_bytes": size, "size_vram_bytes": vram,
-                "detail": f"{vram / 1e9:.2f}GB of {size / 1e9:.2f}GB in VRAM"}
-    if last_error is not None:
-        return {"host": last_host, "reachable": False, "processor": None, "on_gpu": None,
-                "detail": f"{ollama_client._classify(last_error)}: {str(last_error)[:120]}"}
-    return {"host": None, "reachable": False, "processor": None, "on_gpu": None,
-            "detail": "no hosts configured"}
-
-
-def nvidia_smi_utilization():
-    """
-    The optional cross-check from validation.md: GPU utilisation straight from
-    the driver rather than from Ollama's own accounting.
-
-    Only works when this process is running ON the GPU box -- nvidia-smi is a
-    local tool with no remote equivalent, and the app normally runs on a
-    different machine from Ollama. Returns None when it is not available, which
-    is the expected case; that is a "could not cross-check", not a failure, so
-    size_vram from study_gpu_status stays the authoritative signal.
-    """
-    import shutil
-    import subprocess
-
-    if shutil.which("nvidia-smi") is None:
-        return None
-    try:
-        out = subprocess.run(
-            ["nvidia-smi",
-             "--query-gpu=utilization.gpu,memory.used,memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10, check=True,
-        ).stdout.strip()
-    except (subprocess.SubprocessError, OSError):
-        return None
-    gpus = []
-    for line in out.splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) == 3:
-            gpus.append({"utilization_pct": parts[0],
-                          "memory_used_mb": parts[1],
-                          "memory_total_mb": parts[2]})
-    return gpus or None
-
+#
+# study_gpu_status/nvidia_smi_utilization moved to core/ollama_client.py -- they
+# only ever inspect the Ollama host, ollama_client's own domain, and moving them
+# there is what let hermes_agent/app.py's /v1/gpu-status endpoint reuse them
+# instead of duplicating the code. The web route below (used by the live GPU
+# badge) now asks the Hermes agent for this instead of reaching Ollama directly
+# -- the CLI validation study's own internal GPU checks (run_validation_study)
+# still call ollama_client.study_gpu_status() in-process; that offline research
+# tool is not part of the live app's request path and is left as-is for now.
 
 @app.get("/gpu-status")
 def gpu_status():
     """Backs the "Running on:" badge on Screen 1, checked before each run."""
-    status = study_gpu_status()
-    smi = nvidia_smi_utilization()
-    if smi:
-        status["nvidia_smi"] = smi
-    return jsonify(status)
+    return jsonify(hermes_agent_client.gpu_status())
 
 
 # --- step 1: structural validation -----------------------------------------
@@ -1149,59 +1067,43 @@ def study_generate(messages, model, use_agent, hosts=None):
 
 def _study_generate_agent(messages, model, hosts=None):
     """
-    Agent path: the same model through the app's own ollama_client wrapper --
-    streaming, host failover, per-turn retry with backoff, and Ollama's token and
-    timing counters. This is the path production report generation already uses.
+    Agent path: the same model through core.hermes_agent_client -- the Hermes
+    agent's own retry/host-failover/schema-constrained-decoding, plus this
+    client's infra-level retry against the agent itself. This is the path
+    production report generation already uses.
     """
-    result = ollama_client.generate_json(messages, model=model, hosts=hosts)
+    result = hermes_agent_client.generate_json(messages, model=model, hosts=hosts)
     raw = result.get("raw_text") or json.dumps(result.get("parsed"), ensure_ascii=False)
     return raw, result.get("host"), result.get("metrics")
 
 
 def _study_generate_direct(messages, model, hosts=None):
     """
-    Direct path: one raw HTTP POST to /api/chat, no wrapper -- no streaming, no
-    retry, no failover beyond trying the next host in the list.
-
-    Worth knowing when comparing the two: stream=False leaves the connection
-    silent for the whole prompt-eval plus generation window, which on this
-    project's WireGuard path has already been measured long enough to trip a NAT
-    idle timeout. If the direct path shows connection resets the agent path does
-    not, that is the likely cause rather than the model behaving differently.
+    Direct path: one raw HTTP POST to the Hermes agent's /v1/generate -- no
+    client-side retry, no on_retry callback. Still goes through Hermes, never
+    Ollama directly (refinedversion.md: "the model server itself is never
+    exposed directly") -- what "direct" measures now is our own client
+    wrapper's overhead/resilience against the agent, not whether Hermes is
+    involved at all.
     """
-    last_error = None
-    for host in (hosts or config.get_active_hosts()):
-        try:
-            resp = requests.post(
-                f"{host}/api/chat",
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "stream": False,
-                    "format": "json",
-                    "keep_alive": config.OLLAMA_KEEP_ALIVE,
-                    "options": {
-                        "temperature": config.OLLAMA_TEMPERATURE,
-                        "num_ctx": config.OLLAMA_NUM_CTX,
-                        "num_predict": config.OLLAMA_NUM_PREDICT,
-                    },
-                },
-                timeout=(ollama_client.CONNECT_TIMEOUT_SECONDS,
-                          ollama_client.READ_TIMEOUT_SECONDS),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return (data["message"]["content"], host,
-                    ollama_client._extract_metrics(data))
-        except (requests.ConnectionError, requests.Timeout, requests.HTTPError,
-                ValueError, KeyError) as exc:
-            last_error = exc
-            continue
-    error = ollama_client.OllamaUnavailableError(
-        f"direct call failed on every host: {last_error}")
-    error.error_type = (ollama_client._classify(last_error)
-                         if last_error else "unreachable")
-    raise error
+    try:
+        resp = requests.post(
+            f"{config.HERMES_AGENT_URL}/v1/generate",
+            json={"messages": messages, "model": model, "hosts": hosts},
+            headers={"X-API-Key": config.HERMES_AGENT_API_KEY},
+            timeout=(hermes_agent_client.CONNECT_TIMEOUT_SECONDS,
+                     hermes_agent_client.READ_TIMEOUT_SECONDS),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data.get("raw_text") or json.dumps(data.get("parsed"), ensure_ascii=False)
+        return raw, data.get("host"), data.get("metrics")
+    except (requests.ConnectionError, requests.Timeout, requests.HTTPError,
+            ValueError, KeyError) as exc:
+        error = ollama_client.OllamaUnavailableError(
+            f"direct call to Hermes agent failed: {exc}")
+        error.error_type = "unreachable"
+        raise error from exc
 
 
 # --- logging ---------------------------------------------------------------
@@ -1357,8 +1259,8 @@ def run_validation_study(students, mapping, use_agent=None, instructions_text=""
         attempt = cand["attempt"]
         # Checked before every generation, not once per run: a model can be
         # evicted and reloaded onto different hardware partway through a batch.
-        gpu = study_gpu_status(hosts)
-        smi = nvidia_smi_utilization()
+        gpu = ollama_client.study_gpu_status(hosts)
+        smi = ollama_client.nvidia_smi_utilization()
         if smi:
             gpu = {**gpu, "nvidia_smi": smi}
 
@@ -1475,7 +1377,7 @@ def run_validation_study(students, mapping, use_agent=None, instructions_text=""
         "needs_review_count": len(needs_review),
         "total_attempts": sum(r["attempts"] for r in results),
         "elapsed_s": round(time.perf_counter() - started, 2),
-        "gpu_status": study_gpu_status(hosts),
+        "gpu_status": ollama_client.study_gpu_status(hosts),
         "results": results,
         "structural_failures": structural_failures,
         "validation_failures": validation_failures,
@@ -1589,7 +1491,7 @@ def run_study_cli(args):
         students = csv_ingest.parse_csv(f.read(), mapping)
     print(f"source CSV : {csv_path}  ({len(students)} students)")
 
-    gpu = study_gpu_status()
+    gpu = ollama_client.study_gpu_status()
     print(f"running on : {gpu.get('processor') or 'unknown'} -- {gpu.get('detail')}")
     if gpu.get("on_gpu") is False:
         print("  WARNING: generation is not using the GPU.")

@@ -320,3 +320,101 @@ def _try_parse_json(text):
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
         return None
+
+
+# --- GPU / CPU verification --------------------------------------------------
+#
+# Moved here from app.py when generation/validation started routing through the
+# Hermes agent (hermes_agent/app.py) -- this is genuinely about the state of
+# the Ollama host, the same domain as everything else in this module, and it's
+# what hermes_agent/app.py's /v1/gpu-status endpoint calls now. app.py's own
+# /gpu-status route no longer calls these directly; it asks the Hermes agent
+# via core.hermes_agent_client.gpu_status() instead.
+
+def study_gpu_status(hosts=None, timeout=(3, 5)):
+    """
+    The equivalent of `ollama ps`'s PROCESSOR column, read over HTTP so it works
+    against the remote host instead of only on the box itself.
+
+    `ollama ps` derives PROCESSOR from the same numbers /api/ps returns: weights
+    entirely in VRAM show "100% GPU", none in VRAM shows "100% CPU", and a
+    partial offload shows the split. size_vram is the authoritative signal --
+    Ollama falls back to CPU silently, so a host counts as GPU only when it
+    actually reports weights resident in VRAM.
+
+    Never raises: an unreachable host is a result worth logging, not an
+    exception that should abort a run. Returns processor=None when nothing is
+    loaded, because with no resident model there is genuinely nothing to read --
+    that is unknown, not CPU.
+    """
+    last_error = last_host = None
+    for host in (hosts or config.get_active_hosts()):
+        try:
+            resp = requests.get(f"{host}/api/ps", timeout=timeout)
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError,
+                ValueError) as exc:
+            # Fall through to the next host rather than reporting the first
+            # failure as the answer. OLLAMA_HOSTS is a failover chain, so with
+            # the LAN address down but WireGuard up, returning here would show
+            # the host as dead while generation was in fact working fine.
+            last_error, last_host = exc, host
+            continue
+        if not models:
+            return {"host": host, "reachable": True, "processor": None, "on_gpu": None,
+                    "detail": "no model resident -- run a generation first"}
+        model = models[0]
+        size = model.get("size") or 0
+        vram = model.get("size_vram") or 0
+        pct = round(100 * vram / size) if size else 0
+        if pct >= 99:
+            processor = "100% GPU"
+        elif pct <= 0:
+            processor = "100% CPU"
+        else:
+            processor = f"{pct}% GPU / {100 - pct}% CPU"
+        return {"host": host, "reachable": True, "processor": processor,
+                "on_gpu": vram > 0, "model": model.get("name"),
+                "size_bytes": size, "size_vram_bytes": vram,
+                "detail": f"{vram / 1e9:.2f}GB of {size / 1e9:.2f}GB in VRAM"}
+    if last_error is not None:
+        return {"host": last_host, "reachable": False, "processor": None, "on_gpu": None,
+                "detail": f"{_classify(last_error)}: {str(last_error)[:120]}"}
+    return {"host": None, "reachable": False, "processor": None, "on_gpu": None,
+            "detail": "no hosts configured"}
+
+
+def nvidia_smi_utilization():
+    """
+    The optional cross-check from validation.md: GPU utilisation straight from
+    the driver rather than from Ollama's own accounting.
+
+    Only works when this process is running ON the GPU box -- nvidia-smi is a
+    local tool with no remote equivalent. Returns None when it is not
+    available, which is the expected case; that is a "could not cross-check",
+    not a failure, so size_vram from study_gpu_status stays the authoritative
+    signal.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("nvidia-smi") is None:
+        return None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return None
+    gpus = []
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 3:
+            gpus.append({"utilization_pct": parts[0],
+                          "memory_used_mb": parts[1],
+                          "memory_total_mb": parts[2]})
+    return gpus or None

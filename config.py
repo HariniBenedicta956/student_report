@@ -37,6 +37,15 @@ def _resolve_hosts(network_value, lan_hosts, wg_hosts):
 OLLAMA_HOSTS = _resolve_hosts(OLLAMA_NETWORK, OLLAMA_LAN_HOSTS, OLLAMA_WG_HOSTS)
 QWEN_HOSTS = _resolve_hosts(QWEN_NETWORK, QWEN_LAN_HOSTS, QWEN_WG_HOSTS)
 
+# The Hermes agent (hermes_agent/app.py) -- the orchestration layer generation
+# and content validation now route through, per refinedversion.md, instead of
+# core/ollama_client.py talking to OLLAMA_HOSTS/QWEN_HOSTS above directly. Only
+# the Hermes agent process itself still reads those; core/hermes_agent_client.py
+# (what app.py and core/report_queue.py use) only ever needs this URL + key.
+# NOT the "Hermes-3-8B" model (OLLAMA_HERMES3_MODEL below) -- unrelated names.
+HERMES_AGENT_URL = os.environ.get("HERMES_AGENT_URL", "http://localhost:8100").rstrip("/")
+HERMES_AGENT_API_KEY = os.environ.get("HERMES_AGENT_API_KEY", "")
+
 # Hermes is not called at present -- validation.md puts qwen3.5:4b in both roles
 # for the study. The constant stays defined (not deleted) so switching back is a
 # one-line change: MODEL_SELECTION=hermes in .env.

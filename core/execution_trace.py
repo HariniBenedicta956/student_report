@@ -7,12 +7,14 @@ TRACE_STEPS = [
     ("csv_to_json", "CSV -> JSON"),
     ("validate", "Validate"),
     ("build_prompt", "Build Prompt"),
-    # Internal key stays "send_to_hermes" (matches app.py's trace plumbing, from
-    # when Hermes was the only model this app called) -- only the label shown on
-    # the dashboard changes here. It confused a reader into thinking Hermes was
-    # still being called even after MODEL_SELECTION switched to Qwen; the model
-    # actually in use is shown per-request in this step's own "input.model" field.
-    ("send_to_hermes", "Send to AI Model"),
+    # This label used to be a real point of confusion: it said "Send to Hermes"
+    # from when Hermes-3-8B was the only model this app called, then briefly said
+    # "Send to AI Model" once Qwen replaced it as the model with no agent
+    # involved. Now it's accurate again, but means something different --
+    # generation/validation route through the Hermes AGENT (hermes_agent/app.py,
+    # an orchestration layer), which calls qwen3.5:4b underneath. Not the
+    # Hermes-3-8B model. See config.HERMES_AGENT_URL / refinedversion.md.
+    ("send_to_hermes", "Send to Hermes Agent"),
     ("ai_processing", "AI Processing"),
     ("response", "Response"),
     ("parse", "Parse"),

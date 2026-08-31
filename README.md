@@ -16,12 +16,21 @@ core/                      backend logic, imported by app.py
   csv_ingest.py              CSV -> structured student records
   scoring.py                 computed 0-100 section hints
   prompt_builder.py          builds the Ollama messages + output schema
-  ollama_client.py           HTTP calls to Ollama, retry/backoff, capacity probing
+  hermes_agent_client.py     HTTP client to the Hermes agent (below) -- app.py's
+                              only path to a model call now, never Ollama directly
+  ollama_client.py           HTTP calls to Ollama, retry/backoff, capacity probing --
+                              now only imported by hermes_agent/app.py, not app.py
   report_queue.py            priority queue + dynamic worker pool
   pdf_generator.py           renders the final PDF
   storage.py                 batch/manifest/report/trace persistence
   execution_trace.py         per-step data for the Execution Dashboard
   perf_logging.py            structured PERF log lines
+
+hermes_agent/              separate process/service -- the orchestration layer
+  app.py                     generation and content validation route through this
+                              (API-key authenticated), which calls qwen3.5:4b via
+                              core/ollama_client.py. NOT the "Hermes-3-8B" model --
+                              see refinedversion.md and the module's own docstring.
 
 static/, templates/        Screen 1/2 + dashboard frontend (served by Flask)
 data/, output/              runtime data -- uploads and generated reports
@@ -120,6 +129,18 @@ list any pure bookkeeping columns (score/rank/timestamp) in
 `ignored_columns` so they never reach the AI prompt.
 
 ## Run
+
+Two processes now, not one -- the main app never calls Ollama directly, only
+the Hermes agent (see `hermes_agent/app.py`'s docstring and refinedversion.md).
+Start the agent first:
+
+```bash
+python -m hermes_agent.app
+```
+
+It refuses to start unless `HERMES_AGENT_API_KEY` is set in `.env` (generate
+one with `python -c "import secrets; print(secrets.token_hex(24))"`). Then, in
+a second terminal:
 
 ```bash
 python app.py

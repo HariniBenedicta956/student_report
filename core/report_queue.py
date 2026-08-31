@@ -6,7 +6,7 @@ import threading
 import time
 
 import config
-from core import ollama_client
+from core import hermes_agent_client
 
 log = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ class _Pipeline:
     not-before timestamp and the worker immediately takes the next task. A scheduler
     thread moves deferred tasks back into the ready queue once they are due.
 
-    Scaling. Worker count comes from live capacity (see ollama_client.probe_capacity)
+    Scaling. Worker count comes from live capacity (see hermes_agent_client.probe_capacity)
     rather than a constant, and the scheduler re-probes periodically and starts more
     workers if capacity grows -- e.g. a GPU coming online, or a second host being
     added to OLLAMA_HOSTS mid-run. Workers are never killed; they exit when the queue
@@ -167,7 +167,7 @@ class _Pipeline:
     def _maybe_scale_up(self):
         """Start extra workers if capacity has grown since the run began."""
         try:
-            capacity, _ = ollama_client.probe_capacity(self._hosts_provider())
+            capacity, _ = hermes_agent_client.probe_capacity(self._hosts_provider())
         except Exception:  # noqa: BLE001 -- probing must never break a running batch
             return
         with self._cv:
@@ -294,7 +294,7 @@ def process(items, handler, hosts=None, workers=None, max_attempts=None,
             return snapshot
 
     if workers is None:
-        capacity, detail = ollama_client.probe_capacity(hosts_provider())
+        capacity, detail = hermes_agent_client.probe_capacity(hosts_provider())
         workers = min(capacity, config.REPORT_WORKERS_MAX)
         log.info("queue [%s]: detected capacity %d -- %s", label, capacity, detail)
 
