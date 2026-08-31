@@ -7,7 +7,12 @@ TRACE_STEPS = [
     ("csv_to_json", "CSV -> JSON"),
     ("validate", "Validate"),
     ("build_prompt", "Build Prompt"),
-    ("send_to_hermes", "Send to Hermes"),
+    # Internal key stays "send_to_hermes" (matches app.py's trace plumbing, from
+    # when Hermes was the only model this app called) -- only the label shown on
+    # the dashboard changes here. It confused a reader into thinking Hermes was
+    # still being called even after MODEL_SELECTION switched to Qwen; the model
+    # actually in use is shown per-request in this step's own "input.model" field.
+    ("send_to_hermes", "Send to AI Model"),
     ("ai_processing", "AI Processing"),
     ("response", "Response"),
     ("parse", "Parse"),

@@ -161,6 +161,20 @@ function applyStatuses(students) {
     }
   });
   studentCount.textContent = `${students.length} students — ${doneCount} done`;
+
+  // The Validate link is rendered server-side from the page's initial load state --
+  // this keeps it in sync as students finish generating without needing a reload.
+  const validateLink = document.getElementById("validate-link");
+  if (validateLink) {
+    if (doneCount > 0) {
+      validateLink.removeAttribute("data-disabled");
+      validateLink.removeAttribute("title");
+    } else {
+      validateLink.setAttribute("data-disabled", "true");
+      validateLink.title = "No reports finished yet";
+    }
+  }
+
   return allSettled;
 }
 

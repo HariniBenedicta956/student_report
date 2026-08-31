@@ -64,6 +64,20 @@ def _call_host(host, model, messages):
             "messages": messages,
             "stream": True,
             "format": "json",
+            # qwen3.5:4b is a hybrid-thinking model: by default it emits a hidden
+            # chain-of-thought into a SEPARATE "thinking" field before (and instead
+            # of, once num_predict runs out) the actual answer in "content". Verified
+            # directly against the live host: with this left on, a real report
+            # prompt produced 3727 tokens of "thinking", hit num_predict, and
+            # returned an entirely EMPTY "content" (done_reason "length") -- which
+            # then fails _try_parse_json every single time and burns a full retry
+            # (another ~50-90s of pure waste) before failing again. This is what
+            # "invalid_json" retries and slow generation on a GPU host actually were.
+            # With thinking off: done_reason "stop", ~700 tokens, valid JSON,
+            # first try. _consume_stream below also never reads "thinking" -- if
+            # this is ever re-enabled, that has to be read too or the same failure
+            # returns.
+            "think": False,
             # Hold the model (and its KV cache) in memory between calls instead of
             # letting Ollama unload it after its ~5 minute idle default. The load
             # time this saves is minor (~3.4s); what matters is that unloading also
