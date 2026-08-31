@@ -54,8 +54,16 @@ def _trace_dir(batch_id):
     return os.path.join(batch_dir(batch_id), "trace")
 
 
+def _records_dir(batch_id):
+    return os.path.join(batch_dir(batch_id), "records")
+
+
 def manifest_path(batch_id):
     return os.path.join(batch_dir(batch_id), "manifest.json")
+
+
+def validation_path(batch_id):
+    return os.path.join(batch_dir(batch_id), "validation.json")
 
 
 def create_batch(student_records):
@@ -63,6 +71,7 @@ def create_batch(student_records):
     os.makedirs(_json_dir(batch_id), exist_ok=True)
     os.makedirs(_pdf_dir(batch_id), exist_ok=True)
     os.makedirs(_trace_dir(batch_id), exist_ok=True)
+    os.makedirs(_records_dir(batch_id), exist_ok=True)
 
     students = []
     for i, record in enumerate(student_records):
@@ -155,6 +164,38 @@ def save_student_report(batch_id, student_id, report_json):
 def load_student_report(batch_id, student_id):
     path = os.path.join(_json_dir(batch_id), f"{student_id}.json")
     with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_student_record(batch_id, student_id, student_record):
+    """
+    Persists the parsed CSV record (identity + section answers) a student's report
+    was generated from -- not just the report itself. Without this, a later
+    validation pass has no source answers to check the report's content against
+    once the request that generated it is long over. Batches created before this
+    existed simply have no file here: load_student_record raises FileNotFoundError,
+    and the caller treats the content/accuracy check as unavailable for that batch
+    rather than failing.
+    """
+    path = os.path.join(_records_dir(batch_id), f"{student_id}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(student_record, f, indent=2, ensure_ascii=False)
+    return path
+
+
+def load_student_record(batch_id, student_id):
+    path = os.path.join(_records_dir(batch_id), f"{student_id}.json")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_batch_validation(batch_id, validation):
+    with open(validation_path(batch_id), "w", encoding="utf-8") as f:
+        json.dump(validation, f, indent=2, default=str)
+
+
+def load_batch_validation(batch_id):
+    with open(validation_path(batch_id), "r", encoding="utf-8") as f:
         return json.load(f)
 
 

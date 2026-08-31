@@ -185,6 +185,12 @@ def generate():
         return jsonify({"error": "No students selected"}), 400
 
     batch_id, manifest = storage.create_batch(students)
+    # Saved once here rather than left to only live in this request's memory --
+    # it's what lets /batch/<id>/validate check a report's content against the
+    # student's actual answers later, without needing the original CSV to still
+    # be sitting in data/uploads/.
+    for i, record in enumerate(students):
+        storage.save_student_record(batch_id, manifest["students"][i]["student_id"], record)
     perf_logging.log_csv_parse(batch_id, len(students), csv_parse_s)
     shared_trace = _build_shared_trace_steps(
         original_filename, len(csv_bytes), len(students), mapping
@@ -989,6 +995,147 @@ def validate_with_model(report_json, student_record, mapping, question_bank, hos
     if isinstance(errors, str):
         errors = [errors]
     return [str(e) for e in errors], elapsed, raw
+
+
+# --- on-demand validation for an already-generated batch (web UI) ----------
+#
+# Reuses validate_structure/validate_with_model above -- the same two checks the
+# study runs -- against reports that already exist on disk, instead of also
+# regenerating them. No agent-vs-direct comparison, no corrupted-sample
+# injection, no GPU probing: this is the practical "is this batch OK" page, not
+# the research study those exist for.
+
+def _run_batch_validation(batch_id):
+    """
+    Runs sequentially, one model call per student needing a content check -- same
+    reasoning as REPORT_WORKERS' default in config.py: a single CPU-bound Ollama
+    host gains nothing from concurrent requests, they just queue behind each other.
+    Writes validation.json after every student so /batch/<id>/validate/status
+    always reflects real progress, not just the final result.
+    """
+    manifest = storage.load_manifest(batch_id)
+    mapping = csv_ingest.load_section_mapping()
+    done = [s for s in manifest["students"] if s["status"] == "done"]
+
+    # Only batches generated after this feature shipped have source answers saved
+    # per student -- older ones simply have nothing here, and content_checked
+    # stays False for every student below rather than the run failing.
+    records_by_id = {}
+    for s in done:
+        try:
+            records_by_id[s["student_id"]] = storage.load_student_record(batch_id, s["student_id"])
+        except FileNotFoundError:
+            pass
+    question_bank = (
+        prompt_builder.build_question_bank(mapping, list(records_by_id.values()))
+        if records_by_id else None
+    )
+
+    validation = {
+        "batch_id": batch_id,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "students": [{"student_id": s["student_id"], "name": s["name"], "status": "pending"}
+                     for s in done],
+    }
+    storage.save_batch_validation(batch_id, validation)
+
+    for entry in validation["students"]:
+        sid = entry["student_id"]
+        entry["status"] = "running"
+        storage.save_batch_validation(batch_id, validation)
+
+        try:
+            report_json = storage.load_student_report(batch_id, sid)
+        except FileNotFoundError:
+            entry.update(status="error", passed=False, structural_ok=None,
+                         structural_errors=["report JSON not found on disk"],
+                         content_checked=False, content_ok=None, content_errors=[])
+            storage.save_batch_validation(batch_id, validation)
+            continue
+
+        # Same "_"-prefixed keys pdf_generator drops (_perf, _generation_error) --
+        # those are this app's own bookkeeping, not part of the report being checked.
+        report_content = {k: v for k, v in report_json.items() if not k.startswith("_")}
+        structural_errors = validate_structure(report_content, mapping)
+
+        record = records_by_id.get(sid)
+        content_errors, content_checked = [], False
+        if not structural_errors and record is not None:
+            content_errors, _elapsed, _raw = validate_with_model(
+                report_content, record, mapping, question_bank)
+            content_checked = True
+
+        entry.update(
+            status="done",
+            passed=not structural_errors and (not content_checked or not content_errors),
+            structural_ok=not structural_errors,
+            structural_errors=structural_errors,
+            content_checked=content_checked,
+            content_ok=(not content_errors) if content_checked else None,
+            content_errors=content_errors,
+        )
+        storage.save_batch_validation(batch_id, validation)
+
+    validation["finished_at"] = datetime.now(timezone.utc).isoformat()
+    storage.save_batch_validation(batch_id, validation)
+
+
+@app.get("/validate")
+def validate_picker():
+    """The batch picker -- lists every batch that has at least one generated
+    report, newest first (storage.list_batches() already sorts that way)."""
+    batches = []
+    for batch_id in storage.list_batches():
+        try:
+            m = storage.load_manifest(batch_id)
+        except FileNotFoundError:
+            continue
+        done_count = sum(1 for s in m["students"] if s["status"] == "done")
+        batches.append({
+            "batch_id": batch_id,
+            "total": len(m["students"]),
+            "done": done_count,
+        })
+    return render_template("validate.html", batches=batches)
+
+
+@app.post("/batch/<batch_id>/validate")
+def start_batch_validation(batch_id):
+    try:
+        storage.load_manifest(batch_id)
+    except FileNotFoundError:
+        abort(404)
+    thread = threading.Thread(target=_run_batch_validation, args=(batch_id,), daemon=True)
+    thread.start()
+    return jsonify({"status": "started"})
+
+
+@app.get("/batch/<batch_id>/validate")
+def batch_validate_page(batch_id):
+    try:
+        storage.load_manifest(batch_id)
+    except FileNotFoundError:
+        abort(404)
+    return render_template("validate_results.html", batch_id=batch_id)
+
+
+@app.get("/batch/<batch_id>/validate/status")
+def batch_validate_status(batch_id):
+    """
+    started=False (no validation.json yet) is what tells the results page's JS to
+    POST /batch/<id>/validate itself on first load -- so a plain link to this page,
+    from either the picker or the batch's own students page, is enough to kick a
+    run off; revisiting a finished one just shows the stored result instead of
+    starting over.
+    """
+    try:
+        validation = storage.load_batch_validation(batch_id)
+    except FileNotFoundError:
+        return jsonify({"batch_id": batch_id, "started": False, "finished_at": None,
+                         "students": []})
+    validation["started"] = True
+    return jsonify(validation)
 
 
 # --- generation call paths (agent vs direct) -------------------------------

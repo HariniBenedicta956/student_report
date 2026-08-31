@@ -1,0 +1,30 @@
+<title>Validate reports</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+
+<div class="page">
+  <h1>Validate reports</h1>
+  <p class="subtitle">Pick a batch of already-generated reports and check them for structural correctness and factual accuracy.</p>
+
+  <div class="card">
+    {% if batches %}
+    <table>
+      <tbody>
+        {% for b in batches %}
+        <tr>
+          <td class="name">{{ b.batch_id }}<br><span class="meta">{{ b.done }} of {{ b.total }} reports generated</span></td>
+          <td class="action-cell">
+            {% if b.done > 0 %}
+            <a class="btn-primary" href="/batch/{{ b.batch_id }}/validate" style="margin-top:0;">Validate</a>
+            {% else %}
+            <span class="meta">nothing generated yet</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="subtitle" style="margin:0;">No batches yet — <a href="/">generate a batch of reports</a> first.</p>
+    {% endif %}
+  </div>
+</div>

@@ -1,0 +1,26 @@
+<title>Validation — {{ batch_id }}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+
+<div class="page">
+  <h1>Validation results</h1>
+  <p class="subtitle">Batch {{ batch_id }} — <a href="/batch/{{ batch_id }}">view reports</a></p>
+
+  <div class="card">
+    <div class="top-actions">
+      <span class="count" id="validate-count">checking…</span>
+    </div>
+    <table>
+      <tbody id="validate-rows"></tbody>
+    </table>
+  </div>
+
+  <div class="card explore-panel" id="detail-panel">
+    <p class="section-label" id="detail-title">details</p>
+    <pre class="json-view" id="detail-json"></pre>
+  </div>
+</div>
+
+<script>
+  window.BATCH_ID = "{{ batch_id }}";
+</script>
+<script src="{{ url_for('static', filename='js/validate_results.js') }}"></script>
