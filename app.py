@@ -650,6 +650,7 @@ def download_zip(batch_id):
 
 import argparse   # noqa: E402  -- study-only imports, kept with the study code
 import json       # noqa: E402
+import re         # noqa: E402
 import requests   # noqa: E402
 from collections import deque             # noqa: E402
 from datetime import datetime, timezone   # noqa: E402
@@ -838,6 +839,29 @@ def validate_structure(report_json, mapping, required_fields=None):
 
 # --- step 2: model validation ----------------------------------------------
 
+# The exact rubric the content-validation model call is instructed to apply --
+# a single source of truth, also read by batch_validate_page to show the UI's
+# "what each check verifies" panel the literal rubric text rather than a
+# paraphrase that could quietly drift out of sync with what the model is
+# actually told.
+CONTENT_VALIDATION_RUBRIC = [
+    "Hallucinated claims -- every statement in REPORT must be traceable to "
+    "SOURCE_ANSWERS. Flag anything asserted that the source does not support.",
+    "Claims about skills, actions, experience or achievements the student "
+    "did not actually report doing.",
+    "Tier consistency -- each dimension's tier (Strength / Developing / "
+    "Focus Required / Blind Spot) must be defensible from the answers to that "
+    "dimension. Flag a clear mismatch (e.g. 'Strength' where the answers show "
+    "little or no evidence of it, or 'Focus Required' where the answers show "
+    "clear strength), not a borderline judgement call between two adjacent tiers.",
+]
+CONTENT_VALIDATION_EXCLUSION_LINE = (
+    "Do NOT flag tone, encouragement, writing style, formatting, or advice "
+    "about what the student could do next. Advice is not a factual claim "
+    "about them."
+)
+
+
 def build_validation_messages(report_json, student_record, mapping, question_bank):
     """
     Asks the model whether the report is supported by the student's own answers.
@@ -854,18 +878,9 @@ def build_validation_messages(report_json, student_record, mapping, question_ban
         "REPORT (what was generated about them). REPORT is qualitative -- "
         "dimensions with a tier label, not a numeric score. Check ONLY these "
         "three things:",
-        "1. Hallucinated claims -- every statement in REPORT must be traceable to "
-        "SOURCE_ANSWERS. Flag anything asserted that the source does not support.",
-        "2. Claims about skills, actions, experience or achievements the student "
-        "did not actually report doing.",
-        "3. Tier consistency -- each dimension's tier (Strength / Developing / "
-        "Focus Required / Blind Spot) must be defensible from the answers to that "
-        "dimension. Flag a clear mismatch (e.g. 'Strength' where the answers show "
-        "little or no evidence of it, or 'Focus Required' where the answers show "
-        "clear strength), not a borderline judgement call between two adjacent tiers.",
+        *[f"{i}. {item}" for i, item in enumerate(CONTENT_VALIDATION_RUBRIC, start=1)],
         "",
-        "Do NOT flag tone, encouragement, writing style, formatting, or advice about "
-        "what the student could do next. Advice is not a factual claim about them.",
+        CONTENT_VALIDATION_EXCLUSION_LINE,
         "",
         'Respond with ONLY this JSON: {"verdict": "pass" | "fail", "errors": ["..."]}',
         'On pass, "errors" must be an empty array. On fail, each entry is one short, '
@@ -914,26 +929,113 @@ def validate_with_model(report_json, student_record, mapping, question_bank, hos
 # --- on-demand validation for an already-generated batch (web UI) ----------
 #
 # Reuses validate_structure/validate_with_model above -- the same two checks the
-# study runs -- against reports that already exist on disk, instead of also
-# regenerating them. No agent-vs-direct comparison, no corrupted-sample
-# injection, no GPU probing: this is the practical "is this batch OK" page, not
-# the research study those exist for.
+# study runs -- against reports that already exist on disk. Unlike the study,
+# a failure here regenerates in place (refinedversion.md: "on failure it's sent
+# back for regeneration with the original inputs plus the specific error ...
+# capped at 2-3 regenerations") -- this page's job is to leave the batch in a
+# passing state, not just report on it.
 
-def _run_batch_validation(batch_id):
+# refinedversion.md: "structural or content validation failures get 2-3 slower
+# regenerations" -- 3 to match STUDY_RETRY_CAP's convention above.
+VALIDATION_RETRY_CAP = 3
+
+# refinedversion.md's circuit breaker is specified for infra/Gateway failures
+# ("after N consecutive Gateway failures the queue pauses and alerts instead of
+# draining hundreds of jobs against a dead tunnel"); this is the same principle
+# applied to validation itself -- if the first several students in a row all
+# exhaust every retry, that is much more likely a broken prompt/rubric than N
+# independent bad students, and grinding through the rest of the batch at full
+# model-call cost before anyone finds out is exactly the failure mode the
+# breaker exists to avoid. VALIDATION_CIRCUIT_MIN_SAMPLE keeps a small batch
+# (fewer students than the streak length) from ever tripping it.
+VALIDATION_CIRCUIT_STREAK = 5
+VALIDATION_CIRCUIT_MIN_SAMPLE = 5
+
+_INDEX_RE = re.compile(r"\[\d+\]")
+_QUOTED_RE = re.compile(r"'[^']*'")
+_SIGNATURE_SPLIT_MARKERS = (" = ", " is ", " (allowed", " at dimensions")
+
+
+def _error_signature(error_text):
+    """
+    Coarse bucket key for grouping failures that share an underlying cause.
+    refinedversion.md: "42 students failed on missing tier field" -- frequency
+    across a batch is what tells an isolated data problem apart from a systemic
+    rubric/prompt one.
+
+    Structural errors are deterministic strings from validate_structure (e.g.
+    "missing field: dimensions[3].tier"), so stripping the array index and
+    everything after the first value/qualifier reliably collapses "same field,
+    different student or dimension index" into one signature.
+
+    Content errors are free-form model prose describing one specific claim --
+    this same normalization is applied, but it is only a rough approximation
+    for them, and most will end up as their own singleton group. That is
+    honest, not a bug: a content failure usually IS one specific claim, not a
+    shared pattern, unlike a structural one.
+    """
+    text = _INDEX_RE.sub("[]", error_text)
+    text = _QUOTED_RE.sub("'...'", text)
+    for marker in _SIGNATURE_SPLIT_MARKERS:
+        if marker in text:
+            text = text.split(marker, 1)[0]
+            break
+    return text.strip()
+
+
+def _compute_failure_summary(students):
+    """
+    Groups every currently-failed student (done or error status, not passed) by
+    _error_signature, most-frequent first -- the "why is this batch failing"
+    view refinedversion.md describes, computed fresh from whatever has finished
+    so far rather than stored separately and risking drifting out of sync.
+    """
+    groups = {}
+    for s in students:
+        if s.get("status") not in ("done", "error") or s.get("passed"):
+            continue
+        errors = (s.get("structural_errors") or []) + (s.get("content_errors") or [])
+        for err in errors or ["(no error text recorded)"]:
+            sig = _error_signature(err)
+            group = groups.setdefault(sig, {"signature": sig, "count": 0, "student_ids": []})
+            if s["student_id"] not in group["student_ids"]:
+                group["student_ids"].append(s["student_id"])
+                group["count"] += 1
+    return sorted(groups.values(), key=lambda g: -g["count"])
+
+
+def _run_batch_validation(batch_id, student_ids=None):
     """
     Runs sequentially, one model call per student needing a content check -- same
     reasoning as REPORT_WORKERS' default in config.py: a single CPU-bound Ollama
     host gains nothing from concurrent requests, they just queue behind each other.
     Writes validation.json after every student so /batch/<id>/validate/status
     always reflects real progress, not just the final result.
+
+    On failure, regenerates from the original source answers (full regeneration,
+    same as the study's _study_retry_messages -- never a patch) up to
+    VALIDATION_RETRY_CAP times. Every attempt is recorded, including its JSON, so
+    the UI can show what was tried and why each one was rejected. If a retry
+    finally passes, that version overwrites the batch's stored JSON and PDF --
+    this page is meant to leave a batch passing, not just report on it.
+
+    student_ids, if given, scopes the run to just those students -- re-validating
+    only what actually needs it (a "failed only" retrigger, one failure-signature
+    group, or resuming past a tripped circuit breaker) instead of re-running a
+    batch that's mostly already passing. Every other student's existing result in
+    validation.json is left untouched, not reset to pending.
     """
     manifest = storage.load_manifest(batch_id)
     mapping = csv_ingest.load_section_mapping()
     done = [s for s in manifest["students"] if s["status"] == "done"]
+    if student_ids is not None:
+        wanted = set(student_ids)
+        done = [s for s in done if s["student_id"] in wanted]
 
     # Only batches generated after this feature shipped have source answers saved
     # per student -- older ones simply have nothing here, and content_checked
-    # stays False for every student below rather than the run failing.
+    # stays False (and regeneration is skipped) for every student below rather
+    # than the run failing.
     records_by_id = {}
     for s in done:
         try:
@@ -945,16 +1047,62 @@ def _run_batch_validation(batch_id):
         if records_by_id else None
     )
 
+    # A scoped run resets only the students it covers to pending and leaves
+    # every other student's existing entry untouched; a full run (student_ids is
+    # None) starts every "done" student fresh, same as before this option existed.
+    scoped_ids = {s["student_id"] for s in done}
+    fresh_entries = {
+        s["student_id"]: {"student_id": s["student_id"], "name": s["name"], "status": "pending"}
+        for s in done
+    }
+    if student_ids is None:
+        students_list = list(fresh_entries.values())
+    else:
+        try:
+            prior = storage.load_batch_validation(batch_id)
+            existing = {s["student_id"]: s for s in prior.get("students", [])}
+        except FileNotFoundError:
+            existing = {}
+        students_list = [
+            fresh_entries[sid] if sid in scoped_ids else entry
+            for sid, entry in existing.items()
+        ]
+        students_list += [
+            entry for sid, entry in fresh_entries.items() if sid not in existing
+        ]
+
     validation = {
         "batch_id": batch_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "finished_at": None,
-        "students": [{"student_id": s["student_id"], "name": s["name"], "status": "pending"}
-                     for s in done],
+        "circuit_breaker_tripped": False,
+        "students": students_list,
     }
+    validation["failure_summary"] = _compute_failure_summary(validation["students"])
     storage.save_batch_validation(batch_id, validation)
 
+    consecutive_failures = 0
+    processed = 0
     for entry in validation["students"]:
+        if entry["student_id"] not in scoped_ids:
+            continue  # an existing, out-of-scope entry carried over untouched
+
+        if (consecutive_failures >= VALIDATION_CIRCUIT_STREAK and
+                processed >= VALIDATION_CIRCUIT_MIN_SAMPLE):
+            entry.update(
+                status="skipped", passed=False,
+                skipped_reason=(
+                    f"circuit breaker: the {consecutive_failures} students checked "
+                    "immediately before this one all failed every attempt -- almost "
+                    "certainly a systemic prompt/rubric problem rather than isolated "
+                    "bad data, so the rest of this run was stopped before spending more "
+                    "model calls on it. Fix the underlying issue, then re-validate this "
+                    "student (or the remaining skipped ones) directly."),
+            )
+            validation["circuit_breaker_tripped"] = True
+            storage.save_batch_validation(batch_id, validation)
+            continue
+
         sid = entry["student_id"]
         entry["status"] = "running"
         storage.save_batch_validation(batch_id, validation)
@@ -964,31 +1112,109 @@ def _run_batch_validation(batch_id):
         except FileNotFoundError:
             entry.update(status="error", passed=False, structural_ok=None,
                          structural_errors=["report JSON not found on disk"],
-                         content_checked=False, content_ok=None, content_errors=[])
+                         content_checked=False, content_ok=None, content_errors=[],
+                         attempts=[])
+            processed += 1
+            consecutive_failures += 1
+            validation["failure_summary"] = _compute_failure_summary(validation["students"])
             storage.save_batch_validation(batch_id, validation)
             continue
+
+        record = records_by_id.get(sid)
+        # The instruction text isn't saved on the manifest itself, only inside
+        # each student's own execution trace (build_prompt's input_data) -- read
+        # it back from there so a regeneration uses the same instruction the
+        # original generation did. Missing trace (older batch) just means no
+        # instruction is replayed, not that regeneration is skipped outright.
+        instructions_text = ""
+        try:
+            trace = storage.load_student_trace(batch_id, sid)
+            instructions_text = (trace.get("build_prompt", {})
+                                  .get("input_data", {}) or {}).get("instructions_text", "") or ""
+        except FileNotFoundError:
+            pass
 
         # Same "_"-prefixed keys pdf_generator drops (_perf, _generation_error) --
         # those are this app's own bookkeeping, not part of the report being checked.
         report_content = {k: v for k, v in report_json.items() if not k.startswith("_")}
-        structural_errors = validate_structure(report_content, mapping)
+        raw_text = json.dumps(report_content, ensure_ascii=False)
 
-        record = records_by_id.get(sid)
-        content_errors, content_checked = [], False
-        if not structural_errors and record is not None:
-            content_errors, _elapsed, _raw = validate_with_model(
-                report_content, record, mapping, question_bank)
-            content_checked = True
+        attempts_log = []
+        attempt = 0
+        while True:
+            attempt += 1
+            structural_errors = validate_structure(report_content, mapping)
+            content_errors, content_checked = [], False
+            if not structural_errors and record is not None:
+                content_errors, _elapsed, _raw = validate_with_model(
+                    report_content, record, mapping, question_bank)
+                content_checked = True
+            passed = not structural_errors and (not content_checked or not content_errors)
 
+            attempts_log.append({
+                "attempt": attempt,
+                "structural_ok": not structural_errors,
+                "structural_errors": structural_errors,
+                "content_checked": content_checked,
+                "content_ok": (not content_errors) if content_checked else None,
+                "content_errors": content_errors,
+                "report_json": report_content,
+            })
+            entry.update(attempts=attempts_log)
+            storage.save_batch_validation(batch_id, validation)
+
+            # Stop regenerating once it passes, once the source answers needed to
+            # regenerate aren't available, or once the cap is reached -- an
+            # unlimited retry here would hide a systemic rubric/prompt problem
+            # behind an ever-longer wait instead of surfacing it (refinedversion.md).
+            if passed or record is None or attempt >= VALIDATION_RETRY_CAP:
+                break
+
+            errors = structural_errors or content_errors
+            base_messages = prompt_builder.build_messages(
+                record, mapping, instructions_text, question_bank)
+            messages = _study_retry_messages(base_messages, raw_text, errors)
+            try:
+                result = hermes_agent_client.generate_json(
+                    messages, model=config.get_active_ollama_model())
+            except Exception as exc:  # noqa: BLE001 -- recorded, then this student stops retrying
+                attempts_log.append({
+                    "attempt": attempt + 1,
+                    "structural_ok": False,
+                    "structural_errors": [f"regeneration failed: {exc}"],
+                    "content_checked": False, "content_ok": None, "content_errors": [],
+                    "report_json": None,
+                })
+                entry.update(attempts=attempts_log)
+                break
+            parsed = result.get("parsed") or {}
+            report_content = {k: v for k, v in parsed.items() if not k.startswith("_")}
+            raw_text = result.get("raw_text") or json.dumps(report_content, ensure_ascii=False)
+
+        final = attempts_log[-1]
         entry.update(
             status="done",
-            passed=not structural_errors and (not content_checked or not content_errors),
-            structural_ok=not structural_errors,
-            structural_errors=structural_errors,
-            content_checked=content_checked,
-            content_ok=(not content_errors) if content_checked else None,
-            content_errors=content_errors,
+            passed=bool(final["structural_ok"] and (not final["content_checked"] or final["content_ok"])),
+            structural_ok=final["structural_ok"],
+            structural_errors=final["structural_errors"],
+            content_checked=final["content_checked"],
+            content_ok=final["content_ok"],
+            content_errors=final["content_errors"],
+            report_json=final["report_json"],
+            attempts=attempts_log,
         )
+
+        # A retry that ultimately passed produced a genuinely different report
+        # than what's on disk -- write it back (JSON + PDF) so the batch is left
+        # in the passing state this page exists to reach, not just a report about it.
+        if entry["passed"] and attempt > 1 and final["report_json"] is not None:
+            storage.save_student_report(batch_id, sid, final["report_json"])
+            pdf_path = storage.student_pdf_path(batch_id, sid)
+            pdf_generator.generate_pdf(record["identity"], final["report_json"], pdf_path)
+
+        processed += 1
+        consecutive_failures = 0 if entry["passed"] else consecutive_failures + 1
+        validation["failure_summary"] = _compute_failure_summary(validation["students"])
         storage.save_batch_validation(batch_id, validation)
 
     validation["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -1016,11 +1242,22 @@ def validate_picker():
 
 @app.post("/batch/<batch_id>/validate")
 def start_batch_validation(batch_id):
+    """
+    Body is optional. {"student_ids": [...]} scopes the run to just those
+    students (backs "re-validate failed only", "re-validate this failure
+    group", and resuming past a tripped circuit breaker) -- everyone else's
+    existing result is left as-is. No body, or an empty list, means the
+    original behavior: validate every "done" student fresh.
+    """
     try:
         storage.load_manifest(batch_id)
     except FileNotFoundError:
         abort(404)
-    thread = threading.Thread(target=_run_batch_validation, args=(batch_id,), daemon=True)
+    payload = request.get_json(force=True, silent=True) or {}
+    student_ids = payload.get("student_ids") or None
+    thread = threading.Thread(target=_run_batch_validation,
+                               args=(batch_id,), kwargs={"student_ids": student_ids},
+                               daemon=True)
     thread.start()
     return jsonify({"status": "started"})
 
@@ -1031,7 +1268,10 @@ def batch_validate_page(batch_id):
         storage.load_manifest(batch_id)
     except FileNotFoundError:
         abort(404)
-    return render_template("validate_results.html", batch_id=batch_id)
+    return render_template("validate_results.html", batch_id=batch_id,
+                            retry_cap=VALIDATION_RETRY_CAP,
+                            content_rubric=CONTENT_VALIDATION_RUBRIC,
+                            content_exclusion=CONTENT_VALIDATION_EXCLUSION_LINE)
 
 
 @app.get("/batch/<batch_id>/validate/status")

@@ -5,9 +5,44 @@
   <h1>Validation results</h1>
   <p class="subtitle">Batch {{ batch_id }} — <a href="/batch/{{ batch_id }}">view reports</a></p>
 
+  <div class="card criteria-panel">
+    <p class="section-label">What each check verifies</p>
+    <p class="criteria-line"><strong>Structural check</strong> — pure Python, no model call: every
+      required field is present, correctly typed, and non-empty; each dimension's <code>tier</code> is
+      one of the four allowed values (Strength / Developing / Focus Required / Blind Spot); JSON parses
+      at all. It does not judge whether the content is true.</p>
+    <p class="criteria-line"><strong>Content check</strong> — a model call against the student's own
+      answers, judged against exactly this rubric (the literal instruction the model is given, not a
+      paraphrase):</p>
+    <ol class="rubric-list">
+      {% for item in content_rubric %}
+      <li>{{ item }}</li>
+      {% endfor %}
+    </ol>
+    <p class="criteria-line criteria-exclusion">{{ content_exclusion }}</p>
+    <p class="criteria-line">Skipped if the structural check already failed, or if this batch predates
+      per-student source-answer storage.</p>
+    <p class="criteria-line">A failure on either check triggers a full regeneration (never a patch) from
+      the same source answers plus the specific error, up to <strong>{{ retry_cap }} attempts</strong>
+      total. A retry that ultimately passes replaces the batch's stored JSON and PDF.</p>
+  </div>
+
+  <div class="card" id="circuit-breaker-banner" style="display:none">
+    <p class="criteria-line" id="circuit-breaker-text"></p>
+    <button class="link-btn" id="resume-skipped-btn">Resume skipped students</button>
+  </div>
+
+  <div class="card" id="failure-summary-panel" style="display:none">
+    <p class="section-label">Why this batch is failing — grouped by cause</p>
+    <table>
+      <tbody id="failure-summary-rows"></tbody>
+    </table>
+  </div>
+
   <div class="card">
     <div class="top-actions">
       <span class="count" id="validate-count">checking…</span>
+      <button class="link-btn" id="retry-failed-btn" style="display:none">Re-validate failed only</button>
     </div>
     <table>
       <tbody id="validate-rows"></tbody>
@@ -16,11 +51,15 @@
 
   <div class="card explore-panel" id="detail-panel">
     <p class="section-label" id="detail-title">details</p>
-    <pre class="json-view" id="detail-json"></pre>
+    <pre class="json-view" id="detail-summary"></pre>
+    <div id="detail-attempts"></div>
+    <p class="section-label" id="detail-json-label" style="display:none">report JSON (last attempt)</p>
+    <pre class="json-view" id="detail-json" style="display:none"></pre>
   </div>
 </div>
 
 <script>
   window.BATCH_ID = "{{ batch_id }}";
+  window.VALIDATION_RETRY_CAP = {{ retry_cap }};
 </script>
 <script src="{{ url_for('static', filename='js/validate_results.js') }}"></script>

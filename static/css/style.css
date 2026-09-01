@@ -306,6 +306,40 @@ td.action-cell {
   display: none;
 }
 
+.criteria-panel .criteria-line {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin: 0 0 10px 2px;
+  line-height: 1.5;
+}
+
+.criteria-panel .criteria-line:last-child {
+  margin-bottom: 0;
+}
+
+.criteria-panel code {
+  background: var(--bg-outer);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 12px;
+}
+
+.rubric-list {
+  font-size: 13px;
+  color: var(--text-primary);
+  margin: 0 0 10px 2px;
+  padding-left: 20px;
+  line-height: 1.5;
+}
+
+.rubric-list li {
+  margin-bottom: 6px;
+}
+
+.criteria-exclusion {
+  font-style: italic;
+}
+
 .explore-panel .section-label {
   margin-top: 4px;
 }
