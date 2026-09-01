@@ -325,11 +325,11 @@ def _try_parse_json(text):
 # --- GPU / CPU verification --------------------------------------------------
 #
 # Moved here from app.py when generation/validation started routing through the
-# Hermes agent (hermes_agent/app.py) -- this is genuinely about the state of
-# the Ollama host, the same domain as everything else in this module, and it's
-# what hermes_agent/app.py's /v1/gpu-status endpoint calls now. app.py's own
-# /gpu-status route no longer calls these directly; it asks the Hermes agent
-# via core.hermes_agent_client.gpu_status() instead.
+# in-process Hermes orchestration layer (core/hermes_agent_client.py) -- this is
+# genuinely about the state of the Ollama host, the same domain as everything
+# else in this module. app.py's /gpu-status route calls
+# core.hermes_agent_client.gpu_status(), which calls this function directly,
+# in-process -- no separate service, no HTTP hop.
 
 def study_gpu_status(hosts=None, timeout=(3, 5)):
     """

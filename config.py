@@ -37,23 +37,20 @@ def _resolve_hosts(network_value, lan_hosts, wg_hosts):
 OLLAMA_HOSTS = _resolve_hosts(OLLAMA_NETWORK, OLLAMA_LAN_HOSTS, OLLAMA_WG_HOSTS)
 QWEN_HOSTS = _resolve_hosts(QWEN_NETWORK, QWEN_LAN_HOSTS, QWEN_WG_HOSTS)
 
-# The Hermes agent (hermes_agent/app.py) -- the orchestration layer generation
-# and content validation now route through, per refinedversion.md, instead of
-# core/ollama_client.py talking to OLLAMA_HOSTS/QWEN_HOSTS above directly. Only
-# the Hermes agent process itself still reads those; core/hermes_agent_client.py
-# (what app.py and core/report_queue.py use) only ever needs this URL + key.
-# NOT the "Hermes-3-8B" model (OLLAMA_HERMES3_MODEL below) -- unrelated names.
-HERMES_AGENT_URL = os.environ.get("HERMES_AGENT_URL", "http://localhost:8100").rstrip("/")
-HERMES_AGENT_API_KEY = os.environ.get("HERMES_AGENT_API_KEY", "")
-
 # Hermes is not called at present -- validation.md puts qwen3.5:4b in both roles
 # for the study. The constant stays defined (not deleted) so switching back is a
 # one-line change: MODEL_SELECTION=hermes in .env.
 OLLAMA_HERMES3_MODEL = os.environ.get("OLLAMA_HERMES3_MODEL", "hermes3:8b")
 OLLAMA_LLAMA3_MODEL = os.environ.get("OLLAMA_LLAMA3_MODEL", "llama3:8b")
-# qwen3.5:4b, in place of qwen3:14b. It runs both roles in the validation study
-# (generation and validation) -- see validation.md.
-OLLAMA_QWEN3_MODEL = os.environ.get("OLLAMA_QWEN3_MODEL", "qwen3.5:4b")
+# Both qwen sizes are defined; QWEN_MODEL_SIZE picks which one is active, so
+# switching is a one-line flag instead of hand-editing a model tag. Default 9b:
+# a live check via hermes_agent's /v1/gpu-status (2026-08-31) found qwen3.5:9b
+# actually loaded on the GPU server, not qwen3.5:4b as this used to assume.
+# Whichever is active runs both roles in the validation study -- see validation.md.
+OLLAMA_QWEN3_4B_MODEL = os.environ.get("OLLAMA_QWEN3_4B_MODEL", "qwen3.5:4b")
+OLLAMA_QWEN3_9B_MODEL = os.environ.get("OLLAMA_QWEN3_9B_MODEL", "qwen3.5:9b")
+QWEN_MODEL_SIZE = os.environ.get("QWEN_MODEL_SIZE", "9b").strip().lower()
+OLLAMA_QWEN3_MODEL = OLLAMA_QWEN3_4B_MODEL if QWEN_MODEL_SIZE == "4b" else OLLAMA_QWEN3_9B_MODEL
 
 # Defaults to qwen so only qwen3.5:4b runs actively, per validation.md. The
 # previous Hermes default is kept commented rather than deleted.

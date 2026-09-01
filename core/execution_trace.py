@@ -11,9 +11,10 @@ TRACE_STEPS = [
     # from when Hermes-3-8B was the only model this app called, then briefly said
     # "Send to AI Model" once Qwen replaced it as the model with no agent
     # involved. Now it's accurate again, but means something different --
-    # generation/validation route through the Hermes AGENT (hermes_agent/app.py,
-    # an orchestration layer), which calls qwen3.5:4b underneath. Not the
-    # Hermes-3-8B model. See config.HERMES_AGENT_URL / refinedversion.md.
+    # generation/validation route through core/hermes_agent_client.py, the
+    # in-process orchestration layer, which calls qwen3.5 underneath via
+    # ollama_client. Not the Hermes-3-8B model, and not a separate service --
+    # no localhost:8100, no HTTP hop. See core/hermes_agent_client.py's docstring.
     ("send_to_hermes", "Send to Hermes Agent"),
     ("ai_processing", "AI Processing"),
     ("response", "Response"),

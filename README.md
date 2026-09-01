@@ -16,21 +16,15 @@ core/                      backend logic, imported by app.py
   csv_ingest.py              CSV -> structured student records
   scoring.py                 computed 0-100 section hints
   prompt_builder.py          builds the Ollama messages + output schema
-  hermes_agent_client.py     HTTP client to the Hermes agent (below) -- app.py's
-                              only path to a model call now, never Ollama directly
-  ollama_client.py           HTTP calls to Ollama, retry/backoff, capacity probing --
-                              now only imported by hermes_agent/app.py, not app.py
+  hermes_agent_client.py     in-process orchestration layer -- app.py's only path
+                              to a model call, which itself just calls ollama_client
+                              in the same process (no separate service, no HTTP hop)
+  ollama_client.py           HTTP calls to Ollama, retry/backoff, capacity probing
   report_queue.py            priority queue + dynamic worker pool
   pdf_generator.py           renders the final PDF
   storage.py                 batch/manifest/report/trace persistence
   execution_trace.py         per-step data for the Execution Dashboard
   perf_logging.py            structured PERF log lines
-
-hermes_agent/              separate process/service -- the orchestration layer
-  app.py                     generation and content validation route through this
-                              (API-key authenticated), which calls qwen3.5:4b via
-                              core/ollama_client.py. NOT the "Hermes-3-8B" model --
-                              see refinedversion.md and the module's own docstring.
 
 static/, templates/        Screen 1/2 + dashboard frontend (served by Flask)
 data/, output/              runtime data -- uploads and generated reports
@@ -50,9 +44,10 @@ local Ollama install needed):
 ```
 NETWORK_MODE=auto
 MODEL_SELECTION=qwen
-OLLAMA_LAN_URL=http://192.168.68.58:11434
-OLLAMA_WG_URL=http://10.0.0.3:11434
-OLLAMA_QWEN3_MODEL=qwen3.5:4b
+OLLAMA_WG_URL=http://172.30.0.1:11434
+OLLAMA_QWEN3_4B_MODEL=qwen3.5:4b
+OLLAMA_QWEN3_9B_MODEL=qwen3.5:9b
+QWEN_MODEL_SIZE=9b
 OLLAMA_HERMES3_MODEL=hermes3:8b
 ```
 
@@ -62,8 +57,10 @@ OLLAMA_HERMES3_MODEL=hermes3:8b
 - `auto` (default) — tries LAN first, falls back to WireGuard if it's down
 
 `MODEL_SELECTION` picks the model:
-- `qwen` (default) — `qwen3.5:4b`, which also runs both roles in the validation
-  study (see `validation.md`)
+- `qwen` (default) — runs both roles in the validation study (see `validation.md`);
+  `QWEN_MODEL_SIZE` (`4b` or `9b`, default `9b`) then picks which qwen3.5 tag is
+  actually active, so switching sizes is one line instead of editing a model
+  string by hand
 - `hermes` — `hermes3:8b`; not called at present, kept so switching back is one line
 
 See `.env.example` for the full set of knobs (workers, retries, context size).
@@ -130,17 +127,9 @@ list any pure bookkeeping columns (score/rank/timestamp) in
 
 ## Run
 
-Two processes now, not one -- the main app never calls Ollama directly, only
-the Hermes agent (see `hermes_agent/app.py`'s docstring and refinedversion.md).
-Start the agent first:
-
-```bash
-python -m hermes_agent.app
-```
-
-It refuses to start unless `HERMES_AGENT_API_KEY` is set in `.env` (generate
-one with `python -c "import secrets; print(secrets.token_hex(24))"`). Then, in
-a second terminal:
+One process -- `core/hermes_agent_client.py` is an in-process orchestration
+layer, not a separate service; it calls `core/ollama_client.py` directly in
+the same process.
 
 ```bash
 python app.py

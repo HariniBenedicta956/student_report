@@ -346,7 +346,6 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
     storage.update_student_progress(batch_id, student_id, "ai_call")
     selected_model = config.get_active_ollama_model()
     hermes_request_info = {
-        "hermes_agent_endpoint": config.HERMES_AGENT_URL,
         "hosts_tried_in_order": list(ctx.hosts) if ctx else config.get_active_hosts(),
         "model": selected_model,
         "message_count": len(messages),
@@ -716,14 +715,11 @@ STUDY_MIN_HEADLINE_CHARS = 8
 
 # --- GPU / CPU verification ------------------------------------------------
 #
-# study_gpu_status/nvidia_smi_utilization moved to core/ollama_client.py -- they
-# only ever inspect the Ollama host, ollama_client's own domain, and moving them
-# there is what let hermes_agent/app.py's /v1/gpu-status endpoint reuse them
-# instead of duplicating the code. The web route below (used by the live GPU
-# badge) now asks the Hermes agent for this instead of reaching Ollama directly
-# -- the CLI validation study's own internal GPU checks (run_validation_study)
-# still call ollama_client.study_gpu_status() in-process; that offline research
-# tool is not part of the live app's request path and is left as-is for now.
+# study_gpu_status/nvidia_smi_utilization live in core/ollama_client.py -- they
+# only ever inspect the Ollama host, ollama_client's own domain. The web route
+# below (used by the live GPU badge) calls hermes_agent_client.gpu_status(),
+# which is itself just an in-process call straight through to
+# ollama_client.study_gpu_status() -- no separate service, no HTTP hop.
 
 @app.get("/gpu-status")
 def gpu_status():
@@ -1079,31 +1075,14 @@ def _study_generate_agent(messages, model, hosts=None):
 
 def _study_generate_direct(messages, model, hosts=None):
     """
-    Direct path: one raw HTTP POST to the Hermes agent's /v1/generate -- no
-    client-side retry, no on_retry callback. Still goes through Hermes, never
-    Ollama directly (refinedversion.md: "the model server itself is never
-    exposed directly") -- what "direct" measures now is our own client
-    wrapper's overhead/resilience against the agent, not whether Hermes is
-    involved at all.
+    Legacy direct-HTTP-to-Ollama path removed -- all Qwen calls stay in-process
+    through hermes_agent_client now, same as the "agent" path. The two STUDY_PATHS
+    are therefore identical calls; kept distinct only so --mode direct/both/agent
+    still works without a CLI-arg change elsewhere.
     """
-    try:
-        resp = requests.post(
-            f"{config.HERMES_AGENT_URL}/v1/generate",
-            json={"messages": messages, "model": model, "hosts": hosts},
-            headers={"X-API-Key": config.HERMES_AGENT_API_KEY},
-            timeout=(hermes_agent_client.CONNECT_TIMEOUT_SECONDS,
-                     hermes_agent_client.READ_TIMEOUT_SECONDS),
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        raw = data.get("raw_text") or json.dumps(data.get("parsed"), ensure_ascii=False)
-        return raw, data.get("host"), data.get("metrics")
-    except (requests.ConnectionError, requests.Timeout, requests.HTTPError,
-            ValueError, KeyError) as exc:
-        error = ollama_client.OllamaUnavailableError(
-            f"direct call to Hermes agent failed: {exc}")
-        error.error_type = "unreachable"
-        raise error from exc
+    result = hermes_agent_client.generate_json(messages, model=model, hosts=hosts)
+    raw = result.get("raw_text") or json.dumps(result.get("parsed"), ensure_ascii=False)
+    return raw, result.get("host"), result.get("metrics")
 
 
 # --- logging ---------------------------------------------------------------
