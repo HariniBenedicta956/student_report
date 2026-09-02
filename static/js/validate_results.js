@@ -79,11 +79,16 @@ function render(validation) {
     const failedSummary = entry.status === "done" && !entry.passed && entry.recurring_issue_summary
       ? `<div class="meta" style="margin-top:2px;max-width:480px;white-space:normal">${escapeHtml(entry.recurring_issue_summary)}</div>`
       : "";
+    // Details are available the moment a student starts validating, not only
+    // once it settles -- the backend already writes each attempt to disk as
+    // it happens (storage.save_batch_validation), so there's real data to
+    // show mid-run. Only "pending" (not started yet) has nothing to show.
+    const canShowDetail = settled || entry.status === "running";
     tr.innerHTML = `
       <td class="name">${escapeHtml(entry.name || entry.student_id)}${failedSummary}</td>
       <td class="status-cell"><span class="status ${cls}">${statusLabel(entry)}${showDots ? dots() : ""}</span></td>
       <td class="action-cell">
-        <button class="link-btn detail-btn" data-student-id="${entry.student_id}" ${settled ? "" : "disabled"}>Details</button>
+        <button class="link-btn detail-btn" data-student-id="${entry.student_id}" ${canShowDetail ? "" : "disabled"}>Details</button>
         ${hasPdf ? `<a class="link-btn" href="/batch/${batchId}/students/${encodeURIComponent(entry.student_id)}/pdf?download=1">PDF</a>` : ""}
       </td>
     `;
@@ -215,34 +220,52 @@ function attemptBlock(a, index) {
   return block;
 }
 
+// Which student the detail panel is currently showing, if any -- so poll()
+// can keep it live-refreshed while that student is still running, instead of
+// the panel only ever reflecting whatever it looked like at the moment it
+// was opened.
+let openStudentId = null;
+
+function renderDetail(entry, scroll) {
+  detailTitle.textContent = `details — ${entry.name || entry.student_id}`;
+  detailPanel.style.display = "block";
+
+  const attempts = entry.attempts || [];
+  const overall = entry.status === "running" ? "running"
+    : entry.status === "error" ? "error" : (entry.passed ? "passed" : "failed");
+  const metaBits = [`<span>Overall: <b>${overall}</b></span>`];
+  if (attempts.length > 1 || (entry.status === "running" && attempts.length >= 1)) {
+    metaBits.push(`<span>${entry.status === "running" ? "On" : "Resolved after"} <b>${attempts.length}</b> of up to <b>${window.VALIDATION_RETRY_CAP}</b> attempts</span>`);
+  }
+  if (entry.status === "error") {
+    metaBits.push(`<span>${escapeHtml((entry.structural_errors || [])[0] || "report not found")}</span>`);
+  } else if (!entry.content_checked && !(entry.structural_errors || []).length && entry.status !== "running") {
+    metaBits.push(`<span>Content check not available — source answers weren't saved for this batch</span>`);
+  }
+  detailMeta.innerHTML = metaBits.join("");
+
+  detailAttempts.innerHTML = "";
+  if (entry.status === "running" && attempts.length === 0) {
+    const p = document.createElement("p");
+    p.className = "criteria-line";
+    p.textContent = "First attempt is running — this fills in as soon as it completes.";
+    detailAttempts.appendChild(p);
+  }
+  attempts.forEach((a, i) => detailAttempts.appendChild(attemptBlock(a, i)));
+
+  if (scroll) detailPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
 rows.addEventListener("click", (e) => {
   const btn = e.target.closest(".detail-btn");
   if (!btn) return;
+  openStudentId = btn.dataset.studentId;
   fetch(`/batch/${batchId}/validate/status`)
     .then((r) => r.json())
     .then((validation) => {
       const entry = (validation.students || []).find((s) => s.student_id === btn.dataset.studentId);
       if (!entry) return;
-      detailTitle.textContent = `details — ${entry.name || entry.student_id}`;
-      detailPanel.style.display = "block";
-
-      const attempts = entry.attempts || [];
-      const overall = entry.status === "error" ? "error" : (entry.passed ? "passed" : "failed");
-      const metaBits = [`<span>Overall: <b>${overall}</b></span>`];
-      if (attempts.length > 1) {
-        metaBits.push(`<span>Resolved after <b>${attempts.length}</b> of up to <b>${window.VALIDATION_RETRY_CAP}</b> attempts</span>`);
-      }
-      if (entry.status === "error") {
-        metaBits.push(`<span>${escapeHtml((entry.structural_errors || [])[0] || "report not found")}</span>`);
-      } else if (!entry.content_checked && !(entry.structural_errors || []).length) {
-        metaBits.push(`<span>Content check not available — source answers weren't saved for this batch</span>`);
-      }
-      detailMeta.innerHTML = metaBits.join("");
-
-      detailAttempts.innerHTML = "";
-      attempts.forEach((a, i) => detailAttempts.appendChild(attemptBlock(a, i)));
-
-      detailPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      renderDetail(entry, true);
     });
 });
 
@@ -260,6 +283,15 @@ async function poll() {
     const res = await fetch(`/batch/${batchId}/validate/status`);
     const validation = await res.json();
     const settled = render(validation);
+    if (openStudentId) {
+      const entry = (validation.students || []).find((s) => s.student_id === openStudentId);
+      // Keep refreshing the open panel while that student is still going --
+      // once it settles, one more render leaves the final result in place
+      // rather than re-fetching a panel that can no longer change.
+      if (entry && (entry.status === "running" || entry.status === "pending")) {
+        renderDetail(entry, false);
+      }
+    }
     if (!settled) setTimeout(poll, 2000);
   } catch (err) {
     setTimeout(poll, 5000);

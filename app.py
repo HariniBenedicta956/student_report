@@ -685,6 +685,7 @@ import json       # noqa: E402
 import re         # noqa: E402
 import requests   # noqa: E402
 from collections import Counter, deque    # noqa: E402
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 from datetime import datetime, timezone   # noqa: E402
 
 # --- study configuration ---------------------------------------------------
@@ -1179,7 +1180,14 @@ def summarize_recurring_failure(attempts_log, hosts=None):
     (see _run_batch_validation). One short model call over the whole failure
     history -- 2-3 lines naming the recurring pattern, not the full violation
     list repeated for a second time.
+
+    A single attempt has nothing "recurring" to summarize across -- skips the
+    model call entirely in that case (record was unavailable, or the very
+    first regeneration itself failed) and goes straight to the free,
+    deterministic fallback, since it isn't answering a different question.
     """
+    if len(attempts_log) <= 1:
+        return _fallback_failure_summary(attempts_log)
     messages = build_failure_summary_messages(attempts_log)
     try:
         raw, _host, _metrics = study_generate(
@@ -1289,9 +1297,24 @@ def _compute_failure_summary(students):
 
 def _run_batch_validation(batch_id, student_ids=None):
     """
-    Runs sequentially, one model call per student needing a content check -- same
-    reasoning as REPORT_WORKERS' default in config.py: a single CPU-bound Ollama
-    host gains nothing from concurrent requests, they just queue behind each other.
+    Runs students concurrently, sized to the host's real measured capacity
+    (hermes_agent_client.probe_capacity -- the same probe generation's worker
+    pool already uses in core/report_queue.py). This used to run strictly one
+    student at a time regardless of what the host could actually serve, which
+    left a multi-slot GPU host running at a fraction of its real throughput --
+    students are independent of each other, so there is nothing sequential
+    about checking two at once. A single-slot (CPU) host still gets
+    max_workers=1, i.e. the original sequential behavior, unchanged.
+
+    Each student's OWN retry loop stays sequential (attempt 2 depends on
+    attempt 1's result), and shared state -- the circuit-breaker counters and
+    every write to validation.json -- is protected by one lock, since multiple
+    worker threads finishing at nearly the same moment would otherwise race on
+    the same file. "Consecutive" in the circuit breaker becomes an
+    approximation once >1 worker runs concurrently (completion order rather
+    than strict arrival order), but with a small worker count that is a minor
+    drift from the sequential guarantee, not a different one.
+
     Writes validation.json after every student so /batch/<id>/validate/status
     always reflects real progress, not just the final result.
 
@@ -1364,44 +1387,55 @@ def _run_batch_validation(batch_id, student_ids=None):
     validation["failure_summary"] = _compute_failure_summary(validation["students"])
     storage.save_batch_validation(batch_id, validation)
 
-    consecutive_failures = 0
-    processed = 0
-    for entry in validation["students"]:
-        if entry["student_id"] not in scoped_ids:
-            continue  # an existing, out-of-scope entry carried over untouched
+    to_process = [e for e in validation["students"] if e["student_id"] in scoped_ids]
+    try:
+        capacity, _detail = hermes_agent_client.probe_capacity(config.get_active_hosts())
+    except Exception:  # noqa: BLE001 -- probing itself failing just means "assume 1"
+        capacity = 1
+    max_workers = max(1, min(capacity, len(to_process))) if to_process else 1
 
-        if (consecutive_failures >= VALIDATION_CIRCUIT_STREAK and
-                processed >= VALIDATION_CIRCUIT_MIN_SAMPLE):
-            entry.update(
-                status="skipped", passed=False,
-                skipped_reason=(
-                    f"circuit breaker: the {consecutive_failures} students checked "
-                    "immediately before this one all failed every attempt -- almost "
-                    "certainly a systemic prompt/rubric problem rather than isolated "
-                    "bad data, so the rest of this run was stopped before spending more "
-                    "model calls on it. Fix the underlying issue, then re-validate this "
-                    "student (or the remaining skipped ones) directly."),
-            )
-            validation["circuit_breaker_tripped"] = True
-            storage.save_batch_validation(batch_id, validation)
-            continue
+    lock = threading.Lock()
+    # Mutated only under `lock` -- see the docstring above on why "consecutive"
+    # is an approximation once max_workers > 1.
+    state = {"consecutive_failures": 0, "processed": 0}
+
+    def _validate_one(entry):
+        with lock:
+            skip = (state["consecutive_failures"] >= VALIDATION_CIRCUIT_STREAK and
+                    state["processed"] >= VALIDATION_CIRCUIT_MIN_SAMPLE)
+            if skip:
+                entry.update(
+                    status="skipped", passed=False,
+                    skipped_reason=(
+                        f"circuit breaker: the {state['consecutive_failures']} students "
+                        "checked immediately before this one all failed every attempt -- "
+                        "almost certainly a systemic prompt/rubric problem rather than "
+                        "isolated bad data, so the rest of this run was stopped before "
+                        "spending more model calls on it. Fix the underlying issue, then "
+                        "re-validate this student (or the remaining skipped ones) directly."),
+                )
+                validation["circuit_breaker_tripped"] = True
+                storage.save_batch_validation(batch_id, validation)
+                return
 
         sid = entry["student_id"]
-        entry["status"] = "running"
-        storage.save_batch_validation(batch_id, validation)
+        with lock:
+            entry["status"] = "running"
+            storage.save_batch_validation(batch_id, validation)
 
         try:
             report_json = storage.load_student_report(batch_id, sid)
         except FileNotFoundError:
-            entry.update(status="error", passed=False, structural_ok=None,
-                         structural_errors=["report JSON not found on disk"],
-                         content_checked=False, content_ok=None, content_violations=[],
-                         attempts=[])
-            processed += 1
-            consecutive_failures += 1
-            validation["failure_summary"] = _compute_failure_summary(validation["students"])
-            storage.save_batch_validation(batch_id, validation)
-            continue
+            with lock:
+                entry.update(status="error", passed=False, structural_ok=None,
+                             structural_errors=["report JSON not found on disk"],
+                             content_checked=False, content_ok=None, content_violations=[],
+                             attempts=[])
+                state["processed"] += 1
+                state["consecutive_failures"] += 1
+                validation["failure_summary"] = _compute_failure_summary(validation["students"])
+                storage.save_batch_validation(batch_id, validation)
+            return
 
         record = records_by_id.get(sid)
         # The instruction text isn't saved on the manifest itself, only inside
@@ -1447,8 +1481,9 @@ def _run_batch_validation(batch_id, student_ids=None):
                 "content_violations": content_violations,
                 "report_json": report_content,
             })
-            entry.update(attempts=attempts_log)
-            storage.save_batch_validation(batch_id, validation)
+            with lock:
+                entry.update(attempts=attempts_log)
+                storage.save_batch_validation(batch_id, validation)
 
             # Stop regenerating once it passes, once the source answers needed to
             # regenerate aren't available, or once the cap is reached -- an
@@ -1479,28 +1514,32 @@ def _run_batch_validation(batch_id, student_ids=None):
                     "content_checked": False, "content_ok": None, "content_violations": [],
                     "report_json": None,
                 })
-                entry.update(attempts=attempts_log)
+                with lock:
+                    entry.update(attempts=attempts_log)
                 break
             parsed = result.get("parsed") or {}
             report_content = {k: v for k, v in parsed.items() if not k.startswith("_")}
             raw_text = result.get("raw_text") or json.dumps(report_content, ensure_ascii=False)
 
         final = attempts_log[-1]
-        entry.update(
-            status="done",
-            passed=bool(final["structural_ok"] and (not final["content_checked"] or final["content_ok"])),
-            structural_ok=final["structural_ok"],
-            structural_errors=final["structural_errors"],
-            content_checked=final["content_checked"],
-            content_ok=final["content_ok"],
-            content_violations=final["content_violations"],
-            report_json=final["report_json"],
-            attempts=attempts_log,
-        )
+        with lock:
+            entry.update(
+                status="done",
+                passed=bool(final["structural_ok"] and (not final["content_checked"] or final["content_ok"])),
+                structural_ok=final["structural_ok"],
+                structural_errors=final["structural_errors"],
+                content_checked=final["content_checked"],
+                content_ok=final["content_ok"],
+                content_violations=final["content_violations"],
+                report_json=final["report_json"],
+                attempts=attempts_log,
+            )
 
         # A retry that ultimately passed produced a genuinely different report
         # than what's on disk -- write it back (JSON + PDF) so the batch is left
         # in the passing state this page exists to reach, not just a report about it.
+        # Safe without the lock: this writes to sid's own files, never touched
+        # by any other student's worker.
         if entry["passed"] and attempt > 1 and final["report_json"] is not None:
             storage.save_student_report(batch_id, sid, final["report_json"])
             pdf_path = storage.student_pdf_path(batch_id, sid)
@@ -1510,13 +1549,26 @@ def _run_batch_validation(batch_id, student_ids=None):
         # the failed-reports list gets one short recurring-issue line instead
         # of needing to show (or the owner needing to read) the full
         # per-attempt violation history to understand why this one failed.
+        # A model call, not shared state -- safe outside the lock.
+        recurring_summary = None
         if not entry["passed"]:
-            entry["recurring_issue_summary"] = summarize_recurring_failure(attempts_log)
+            recurring_summary = summarize_recurring_failure(attempts_log)
 
-        processed += 1
-        consecutive_failures = 0 if entry["passed"] else consecutive_failures + 1
-        validation["failure_summary"] = _compute_failure_summary(validation["students"])
-        storage.save_batch_validation(batch_id, validation)
+        with lock:
+            if recurring_summary is not None:
+                entry["recurring_issue_summary"] = recurring_summary
+            state["processed"] += 1
+            state["consecutive_failures"] = 0 if entry["passed"] else state["consecutive_failures"] + 1
+            validation["failure_summary"] = _compute_failure_summary(validation["students"])
+            storage.save_batch_validation(batch_id, validation)
+
+    if to_process:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # list(...) forces every future to resolve (and any unexpected
+            # exception inside _validate_one to surface) before the batch is
+            # marked finished, same guarantee the old sequential for-loop gave
+            # for free.
+            list(executor.map(_validate_one, to_process))
 
     validation["finished_at"] = datetime.now(timezone.utc).isoformat()
     storage.save_batch_validation(batch_id, validation)
