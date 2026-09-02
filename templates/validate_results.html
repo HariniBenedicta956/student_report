@@ -5,6 +5,11 @@
   <h1>Validation results</h1>
   <p class="subtitle">Batch {{ batch_id }} — <a href="/batch/{{ batch_id }}">view reports</a></p>
 
+  <div class="card" id="summary-panel" style="display:none">
+    <p class="section-label">Summary</p>
+    <p id="summary-line" class="summary-line"></p>
+  </div>
+
   <div class="card criteria-panel">
     <p class="section-label">What each check verifies</p>
     <p class="criteria-line"><strong>Structural check</strong> — pure Python, no model call: every
@@ -42,7 +47,10 @@
   <div class="card">
     <div class="top-actions">
       <span class="count" id="validate-count">checking…</span>
-      <button class="link-btn" id="retry-failed-btn" style="display:none">Re-validate failed only</button>
+      <div class="buttons">
+        <button class="link-btn" id="retry-failed-btn" style="display:none">Re-validate failed only</button>
+        <a class="link-btn" id="download-zip-btn" href="/batch/{{ batch_id }}/zip" style="display:none">Download all as zip</a>
+      </div>
     </div>
     <table>
       <tbody id="validate-rows"></tbody>
@@ -51,15 +59,16 @@
 
   <div class="card explore-panel" id="detail-panel">
     <p class="section-label" id="detail-title">details</p>
-    <pre class="json-view" id="detail-summary"></pre>
+    <div class="detail-meta" id="detail-meta"></div>
     <div id="detail-attempts"></div>
-    <p class="section-label" id="detail-json-label" style="display:none">report JSON (last attempt)</p>
-    <pre class="json-view" id="detail-json" style="display:none"></pre>
   </div>
 </div>
 
 <script>
   window.BATCH_ID = "{{ batch_id }}";
   window.VALIDATION_RETRY_CAP = {{ retry_cap }};
+  window.STRUCTURAL_RULES = {{ structural_rules | tojson }};
+  window.CONTENT_RUBRIC = {{ content_rubric | tojson }};
+  window.CONTENT_EXCLUSION = {{ content_exclusion | tojson }};
 </script>
 <script src="{{ url_for('static', filename='js/validate_results.js') }}"></script>

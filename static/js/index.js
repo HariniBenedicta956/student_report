@@ -11,6 +11,10 @@ const checklist = document.getElementById("student-checklist");
 const qbankDropzone = document.getElementById("qbank-dropzone");
 const qbankFileInput = document.getElementById("qbank-file-input");
 const qbankFilename = document.getElementById("qbank-filename");
+const minCompletionInput = document.getElementById("min-completion");
+const minScoreInput = document.getElementById("min-score");
+const syncEligibilityBtn = document.getElementById("sync-eligibility-btn");
+const eligibilitySummary = document.getElementById("eligibility-summary");
 
 let uploadId = null;
 let uploadedStudents = [];
@@ -68,13 +72,18 @@ async function handleFile(file) {
 
 function renderChecklist() {
   checklist.innerHTML = "";
+  eligibilitySummary.textContent = "";
   uploadedStudents.forEach((s) => {
     const row = document.createElement("label");
     row.className = "checklist-row";
+    row.dataset.index = s.index;
+    const scoreText = s.overall_score === null || s.overall_score === undefined
+      ? ""
+      : ` · score ${s.overall_score}%`;
     row.innerHTML = `
       <input type="checkbox" checked data-index="${s.index}">
       <span>${s.name || "(no name)"}</span>
-      <span class="meta">${[s.branch, s.year].filter(Boolean).join(" / ")}</span>
+      <span class="meta">${[s.branch, s.year].filter(Boolean).join(" / ")} · ${s.completion_pct}% complete${scoreText}</span>
     `;
     row.querySelector("input").addEventListener("change", updateSelectCount);
     checklist.appendChild(row);
@@ -82,6 +91,41 @@ function renderChecklist() {
   selectCard.style.display = "block";
   updateSelectCount();
 }
+
+// A database check only, no model call, per refinedversion.md's Sync Eligibility --
+// this app has no database, so "the database" is the parsed CSV's own completion_pct
+// / overall_score (real per-student figures from /upload, not a stub). Sync pre-checks
+// only the students who clear both thresholds; ineligible rows are unchecked and
+// flagged, but stay editable so an admin can still override by hand.
+syncEligibilityBtn.addEventListener("click", () => {
+  const minCompletion = parseFloat(minCompletionInput.value) || 0;
+  const minScoreRaw = minScoreInput.value.trim();
+  const minScore = minScoreRaw === "" ? null : parseFloat(minScoreRaw);
+
+  let eligibleCount = 0;
+  checklist.querySelectorAll(".checklist-row").forEach((row) => {
+    const index = parseInt(row.dataset.index, 10);
+    const student = uploadedStudents.find((s) => s.index === index);
+    const checkbox = row.querySelector("input[type=checkbox]");
+
+    const meetsCompletion = student.completion_pct >= minCompletion;
+    const meetsScore =
+      minScore === null ? true : student.overall_score !== null && student.overall_score >= minScore;
+    const eligible = meetsCompletion && meetsScore;
+
+    checkbox.checked = eligible;
+    row.classList.toggle("ineligible", !eligible);
+    row.title = eligible
+      ? ""
+      : !meetsCompletion
+        ? `Below ${minCompletion}% completion (has ${student.completion_pct}%)`
+        : `Below ${minScore}% score (${student.overall_score === null ? "no score" : student.overall_score + "%"})`;
+    if (eligible) eligibleCount += 1;
+  });
+
+  eligibilitySummary.textContent = `${eligibleCount} of ${uploadedStudents.length} eligible`;
+  updateSelectCount();
+});
 
 function updateSelectCount() {
   const total = checklist.querySelectorAll("input[type=checkbox]").length;

@@ -19,6 +19,7 @@ from core import pdf_generator
 from core import perf_logging
 from core import prompt_builder
 from core import report_queue
+from core import scoring
 from core import storage
 
 logging.basicConfig(level=logging.INFO)
@@ -80,6 +81,15 @@ def upload():
                 "name": s["identity"].get("name", ""),
                 "branch": s["identity"].get("branch", ""),
                 "year": s["identity"].get("year", ""),
+                # Real per-student figures computed from this CSV's own answers --
+                # what Sync Eligibility on Screen 1 filters against (see
+                # refinedversion.md: "admin sets eligibility criteria (e.g.
+                # completion %) and clicks Sync Eligibility, a database check only
+                # with no model call"). This app has no database; the parsed CSV is
+                # the only real record of what a student answered, so that's what
+                # gets checked instead of a stub.
+                "completion_pct": s.get("completion_pct", 0.0),
+                "overall_score": scoring.compute_overall_score(s["sections"]),
             }
             for i, s in enumerate(students)
         ],
@@ -409,6 +419,9 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
                 model=selected_model,
                 on_retry=_on_retry,
                 hosts=ctx.hosts if ctx else None,
+                # None for a QA-listing request -- build_advice_messages asks for a
+                # different, smaller shape (just advice text), not the report schema.
+                json_schema=None if is_qa_request else prompt_builder.REPORT_JSON_SCHEMA,
             )
         report_json = result["parsed"]
         attempts = result["attempts"]
@@ -695,13 +708,39 @@ STUDY_SUMMARY_PATH = os.path.join(config.BASE_DIR, "output", "validation_summary
 # names validation.md was written against (dimensions, single_priority, tier,
 # strong/focus/blindspot). Taken from prompt_builder rather than restated, so the
 # validator cannot drift from what the model is actually asked to produce.
-STUDY_REQUIRED_FIELDS = ("intro_message", "dimensions", "single_priority")
+# blindspot deliberately excluded -- the prompt says to include one only when the
+# answers genuinely evidence it (an empty-handed guess there is worse than none),
+# so its absence is legitimate. strong/focus have no such carve-out in the prompt
+# ("their strongest patterns -- 2-3 entries" / "where focus pays off most -- 2-3
+# entries") -- a report missing them outright previously passed this check
+# silently (the card-arrays loop below only checks a field IF present), which a
+# live test caught: a real generation came back with no strong/focus/blindspot
+# at all and nothing flagged it.
+STUDY_REQUIRED_FIELDS = ("intro_message", "dimensions", "single_priority", "strong", "focus")
 STUDY_CARD_FIELDS = {          # array field -> keys each card must carry
     "strong": ("headline", "body"),
     "focus": ("headline", "body", "action"),
     "blindspot": ("headline", "body", "action"),
 }
 STUDY_ALLOWED_TIERS = prompt_builder.TIERS
+
+# Human-readable restatement of what validate_structure() below actually checks,
+# built from the same constants (not hand-copied) so it can't drift out of sync --
+# shown in the validate results UI as the "rules checked" for the structural step,
+# the same way build_validation_messages' rubric is shown for the content step.
+STRUCTURAL_VALIDATION_RULES = [
+    f"Required top-level fields present: {', '.join(STUDY_REQUIRED_FIELDS)}.",
+    "Every field is the correct type (string / array / object) and non-empty.",
+    f"Narrative text fields are at least {STUDY_MIN_TEXT_CHARS} characters "
+    "(shorter reads as truncated, not a real answer).",
+    f"Each dimension's tier is exactly one of: {', '.join(STUDY_ALLOWED_TIERS)}.",
+    "strong / focus / blindspot cards carry their required keys: "
+    + "; ".join(f"{field} needs {', '.join(keys)}" for field, keys in STUDY_CARD_FIELDS.items())
+    + " (blindspot may be an empty array; the others may not).",
+    "No stray numeric fields (score, percentage, rating, etc.) -- this report is "
+    "qualitative, the template has nowhere to render them.",
+    "Valid JSON overall.",
+]
 
 # One deviation from validation.md worth being explicit about: it asks for
 # `score` to be numeric and within 0-100, but the template it describes is
@@ -845,21 +884,49 @@ def validate_structure(report_json, mapping, required_fields=None):
 # paraphrase that could quietly drift out of sync with what the model is
 # actually told.
 CONTENT_VALIDATION_RUBRIC = [
-    "Hallucinated claims -- every statement in REPORT must be traceable to "
-    "SOURCE_ANSWERS. Flag anything asserted that the source does not support.",
-    "Claims about skills, actions, experience or achievements the student "
-    "did not actually report doing.",
-    "Tier consistency -- each dimension's tier (Strength / Developing / "
-    "Focus Required / Blind Spot) must be defensible from the answers to that "
-    "dimension. Flag a clear mismatch (e.g. 'Strength' where the answers show "
-    "little or no evidence of it, or 'Focus Required' where the answers show "
-    "clear strength), not a borderline judgement call between two adjacent tiers.",
+    "Unsupported claims -- every claim in REPORT must trace to a specific answer "
+    "in SOURCE_ANSWERS. Flag anything asserted, implied, or generalized that the "
+    "source does not specifically support (including skills, actions, experience "
+    "or achievements the student did not actually report).",
+    "Tier-criteria match -- each dimension's assigned tier (Strength / Developing "
+    "/ Focus Required / Blind Spot) must follow from a specific, stated reason "
+    "grounded in the answers for that dimension, not a generic or default-feeling "
+    "assignment. Flag a tier whose rationale isn't tied to something specific in "
+    "that dimension's own answers.",
+    "Non-generic dimensions -- no dimension's name or description may be generic "
+    "enough to apply interchangeably to a different student. Flag a dimension "
+    "that reads as boilerplate career advice rather than something this "
+    "student's own answers specifically showed.",
+    "Specific, actionable priority -- single_priority must name one concrete "
+    "focus or action grounded in this student's own answers, not vague "
+    "encouragement (e.g. 'keep working hard', 'stay motivated', 'believe in "
+    "yourself'). Flag a priority generic enough to apply to any student.",
 ]
 CONTENT_VALIDATION_EXCLUSION_LINE = (
-    "Do NOT flag tone, encouragement, writing style, formatting, or advice "
-    "about what the student could do next. Advice is not a factual claim "
-    "about them."
+    "Do NOT flag tone, warmth, encouraging phrasing, or formatting on their own -- "
+    "only flag content that fails one of the four checks above (unsupported, "
+    "tier not grounded in stated reasons, generic/interchangeable, or vague "
+    "and non-actionable)."
 )
+
+# Schema-constrains the validator's OWN output shape ({"verdict", "errors"}),
+# not the report it's judging -- fixes "validator did not return a usable
+# verdict" (observed live: without this, the validator's generate_json call was
+# accidentally sharing _study_generate_agent/_direct with report generation and
+# getting schema-constrained into the REPORT shape instead, which obviously
+# cannot come back as a verdict). This only makes the verdict itself reliably
+# parseable; it has no effect on what the validator is asked to judge or how
+# strict the rubric is -- the content check stays exactly as mandatory and
+# exactly as strict as it already was.
+CONTENT_VALIDATION_VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "fail"]},
+        "errors": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["verdict", "errors"],
+    "additionalProperties": False,
+}
 
 
 def build_validation_messages(report_json, student_record, mapping, question_bank):
@@ -872,19 +939,21 @@ def build_validation_messages(report_json, student_record, mapping, question_ban
     saw, not to a paraphrase of it that could differ in a way that matters.
     """
     system = "\n".join([
-        "You are validating a generated student report for factual accuracy.",
+        "You are validating a generated student report for factual accuracy and "
+        "specificity to this one student.",
         "",
         "You are given SOURCE_ANSWERS (what the student actually answered) and "
         "REPORT (what was generated about them). REPORT is qualitative -- "
         "dimensions with a tier label, not a numeric score. Check ONLY these "
-        "three things:",
+        "four things:",
         *[f"{i}. {item}" for i, item in enumerate(CONTENT_VALIDATION_RUBRIC, start=1)],
         "",
         CONTENT_VALIDATION_EXCLUSION_LINE,
         "",
         'Respond with ONLY this JSON: {"verdict": "pass" | "fail", "errors": ["..."]}',
         'On pass, "errors" must be an empty array. On fail, each entry is one short, '
-        "specific sentence naming the offending claim or dimension/tier.",
+        "specific sentence naming the offending claim, dimension/tier, or generic "
+        "phrase, and which of the four checks it violates.",
     ])
     payload = {
         "SOURCE_ANSWERS": json.loads(
@@ -909,8 +978,9 @@ def validate_with_model(report_json, student_record, mapping, question_bank, hos
     messages = build_validation_messages(report_json, student_record, mapping, question_bank)
     t0 = time.perf_counter()
     try:
-        raw, _host, _metrics = study_generate(messages, STUDY_VALIDATION_MODEL,
-                                               STUDY_VALIDATION_USES_AGENT, hosts)
+        raw, _host, _metrics = study_generate(
+            messages, STUDY_VALIDATION_MODEL, STUDY_VALIDATION_USES_AGENT, hosts,
+            json_schema=CONTENT_VALIDATION_VERDICT_SCHEMA)
     except Exception as exc:  # noqa: BLE001 -- a dead validator is a result, not a crash
         return [f"validator call failed: {exc}"], round(time.perf_counter() - t0, 3), None
     elapsed = round(time.perf_counter() - t0, 3)
@@ -1176,7 +1246,8 @@ def _run_batch_validation(batch_id, student_ids=None):
             messages = _study_retry_messages(base_messages, raw_text, errors)
             try:
                 result = hermes_agent_client.generate_json(
-                    messages, model=config.get_active_ollama_model())
+                    messages, model=config.get_active_ollama_model(),
+                    json_schema=prompt_builder.REPORT_JSON_SCHEMA)
             except Exception as exc:  # noqa: BLE001 -- recorded, then this student stops retrying
                 attempts_log.append({
                     "attempt": attempt + 1,
@@ -1271,7 +1342,8 @@ def batch_validate_page(batch_id):
     return render_template("validate_results.html", batch_id=batch_id,
                             retry_cap=VALIDATION_RETRY_CAP,
                             content_rubric=CONTENT_VALIDATION_RUBRIC,
-                            content_exclusion=CONTENT_VALIDATION_EXCLUSION_LINE)
+                            content_exclusion=CONTENT_VALIDATION_EXCLUSION_LINE,
+                            structural_rules=STRUCTURAL_VALIDATION_RULES)
 
 
 @app.get("/batch/<batch_id>/validate/status")
@@ -1294,33 +1366,44 @@ def batch_validate_status(batch_id):
 
 # --- generation call paths (agent vs direct) -------------------------------
 
-def study_generate(messages, model, use_agent, hosts=None):
-    """Both paths use the same model; only how the call is made differs."""
+def study_generate(messages, model, use_agent, hosts=None, json_schema=None):
+    """
+    Both paths use the same model; only how the call is made differs.
+
+    json_schema is the caller's responsibility, not a default here -- this one
+    function serves both report generation (REPORT_JSON_SCHEMA) and content
+    validation (CONTENT_VALIDATION_VERDICT_SCHEMA), and those are two entirely
+    different output shapes. Guessing one here previously caused exactly that
+    bug: the validator's call inherited the report schema and its output
+    stopped parsing as a verdict at all.
+    """
     if use_agent:
-        return _study_generate_agent(messages, model, hosts)
-    return _study_generate_direct(messages, model, hosts)
+        return _study_generate_agent(messages, model, hosts, json_schema)
+    return _study_generate_direct(messages, model, hosts, json_schema)
 
 
-def _study_generate_agent(messages, model, hosts=None):
+def _study_generate_agent(messages, model, hosts=None, json_schema=None):
     """
     Agent path: the same model through core.hermes_agent_client -- the Hermes
     agent's own retry/host-failover/schema-constrained-decoding, plus this
     client's infra-level retry against the agent itself. This is the path
     production report generation already uses.
     """
-    result = hermes_agent_client.generate_json(messages, model=model, hosts=hosts)
+    result = hermes_agent_client.generate_json(
+        messages, model=model, hosts=hosts, json_schema=json_schema)
     raw = result.get("raw_text") or json.dumps(result.get("parsed"), ensure_ascii=False)
     return raw, result.get("host"), result.get("metrics")
 
 
-def _study_generate_direct(messages, model, hosts=None):
+def _study_generate_direct(messages, model, hosts=None, json_schema=None):
     """
     Legacy direct-HTTP-to-Ollama path removed -- all Qwen calls stay in-process
     through hermes_agent_client now, same as the "agent" path. The two STUDY_PATHS
     are therefore identical calls; kept distinct only so --mode direct/both/agent
     still works without a CLI-arg change elsewhere.
     """
-    result = hermes_agent_client.generate_json(messages, model=model, hosts=hosts)
+    result = hermes_agent_client.generate_json(
+        messages, model=model, hosts=hosts, json_schema=json_schema)
     raw = result.get("raw_text") or json.dumps(result.get("parsed"), ensure_ascii=False)
     return raw, result.get("host"), result.get("metrics")
 
@@ -1496,7 +1579,8 @@ def run_validation_study(students, mapping, use_agent=None, instructions_text=""
         raw = parsed = host = metrics = None
         try:
             raw, host, metrics = study_generate(
-                messages, STUDY_GENERATION_MODEL, use_agent, hosts)
+                messages, STUDY_GENERATION_MODEL, use_agent, hosts,
+                json_schema=prompt_builder.REPORT_JSON_SCHEMA)
             parsed = ollama_client._try_parse_json(raw)
             if parsed is None:
                 gen_error = "model output was not valid JSON"

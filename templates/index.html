@@ -43,6 +43,16 @@
   </div>
 
   <div class="card" id="student-select-card" style="display:none;">
+    <div class="eligibility-row">
+      <div class="eligibility-inputs">
+        <label for="min-completion">Min completion %</label>
+        <input type="number" id="min-completion" min="0" max="100" step="1" value="80">
+        <label for="min-score">Min score % (optional)</label>
+        <input type="number" id="min-score" min="0" max="100" step="1" placeholder="any">
+        <button class="btn-secondary" type="button" id="sync-eligibility-btn">Sync Eligibility</button>
+      </div>
+      <span class="meta" id="eligibility-summary"></span>
+    </div>
     <div class="top-actions">
       <span class="count" id="select-count">0 selected</span>
       <div class="buttons">

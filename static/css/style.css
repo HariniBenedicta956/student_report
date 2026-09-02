@@ -198,6 +198,42 @@ a[data-disabled="true"] {
 
 .checklist-row .meta { margin-left: auto; }
 
+.checklist-row.ineligible { opacity: 0.55; }
+.checklist-row.ineligible .meta { color: var(--amber); }
+
+.eligibility-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 0.5px solid var(--border);
+}
+
+.eligibility-inputs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.eligibility-inputs input[type=number] {
+  width: 56px;
+  padding: 6px 8px;
+  border: 0.5px solid var(--border);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 13px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+}
+
+.eligibility-row .meta { font-size: 12px; }
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -338,6 +374,16 @@ td.action-cell {
 
 .criteria-exclusion {
   font-style: italic;
+}
+
+.summary-line {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.summary-line .rate {
+  color: var(--teal);
 }
 
 .explore-panel .section-label {

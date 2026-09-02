@@ -3,16 +3,17 @@ const rows = document.getElementById("validate-rows");
 const countEl = document.getElementById("validate-count");
 const detailPanel = document.getElementById("detail-panel");
 const detailTitle = document.getElementById("detail-title");
-const detailSummary = document.getElementById("detail-summary");
+const detailMeta = document.getElementById("detail-meta");
 const detailAttempts = document.getElementById("detail-attempts");
-const detailJsonLabel = document.getElementById("detail-json-label");
-const detailJson = document.getElementById("detail-json");
 const breakerBanner = document.getElementById("circuit-breaker-banner");
 const breakerText = document.getElementById("circuit-breaker-text");
 const resumeSkippedBtn = document.getElementById("resume-skipped-btn");
 const failureSummaryPanel = document.getElementById("failure-summary-panel");
 const failureSummaryRows = document.getElementById("failure-summary-rows");
 const retryFailedBtn = document.getElementById("retry-failed-btn");
+const downloadZipBtn = document.getElementById("download-zip-btn");
+const summaryPanel = document.getElementById("summary-panel");
+const summaryLine = document.getElementById("summary-line");
 
 function statusLabel(entry) {
   if (entry.status === "pending") return "Pending";
@@ -72,10 +73,14 @@ function render(validation) {
     const tr = document.createElement("tr");
     const cls = statusClass(entry);
     const showDots = entry.status === "pending" || entry.status === "running";
+    const hasPdf = entry.status === "done" && entry.passed;
     tr.innerHTML = `
       <td class="name">${escapeHtml(entry.name || entry.student_id)}</td>
       <td class="status-cell"><span class="status ${cls}">${statusLabel(entry)}${showDots ? dots() : ""}</span></td>
-      <td class="action-cell"><button class="link-btn detail-btn" data-student-id="${entry.student_id}" ${settled ? "" : "disabled"}>Details</button></td>
+      <td class="action-cell">
+        <button class="link-btn detail-btn" data-student-id="${entry.student_id}" ${settled ? "" : "disabled"}>Details</button>
+        ${hasPdf ? `<a class="link-btn" href="/batch/${batchId}/students/${encodeURIComponent(entry.student_id)}/pdf?download=1">PDF</a>` : ""}
+      </td>
     `;
     rows.appendChild(tr);
   });
@@ -91,6 +96,18 @@ function render(validation) {
   const finished = validation.finished_at != null;
   retryFailedBtn.style.display = finished && failedIds.length ? "" : "none";
   retryFailedBtn.onclick = () => triggerRevalidation(failedIds);
+  downloadZipBtn.style.display = finished && passCount ? "" : "none";
+
+  // The short summary this page ends with -- counts and a rate, not the trace.
+  if (finished && students.length) {
+    const failCount = settledCount - passCount;
+    const rate = Math.round((passCount / students.length) * 100);
+    summaryPanel.style.display = "";
+    summaryLine.innerHTML =
+      `${passCount} passed, ${failCount} failed — <span class="rate">${rate}% pass rate</span>`;
+  } else {
+    summaryPanel.style.display = "none";
+  }
 
   if (validation.circuit_breaker_tripped && skippedIds.length) {
     breakerBanner.style.display = "block";
@@ -123,19 +140,72 @@ function render(validation) {
   return finished;
 }
 
-function attemptLine(a) {
-  const bits = [];
-  if (a.report_json === null && a.structural_errors && a.structural_errors[0] &&
-      a.structural_errors[0].startsWith("regeneration failed")) {
-    return `Attempt ${a.attempt}: ${a.structural_errors[0]}`;
+// One block per attempt, styled like the Execution Dashboard's Code/Input/
+// Output layout (static/js/dashboard.js) -- "rules checked" stands in for
+// Code, "JSON validated" for Input, "result" for Output, so validation gets
+// the same trace visibility generation already has.
+function attemptBlock(a, index) {
+  const wasRegenFailure = a.report_json === null && a.structural_errors &&
+    a.structural_errors[0] && a.structural_errors[0].startsWith("regeneration failed");
+  const block = document.createElement("div");
+  block.className = "detail-block";
+
+  const passed = !wasRegenFailure && a.structural_ok && (!a.content_checked || a.content_ok);
+  const meta = document.createElement("div");
+  meta.className = "detail-meta";
+  meta.innerHTML = `<span>Attempt <b>${a.attempt}</b> of up to <b>${window.VALIDATION_RETRY_CAP}</b></span>` +
+    `<span>Result: <b>${wasRegenFailure ? "regeneration failed" : (passed ? "passed" : "failed")}</b></span>`;
+  block.appendChild(meta);
+
+  if (wasRegenFailure) {
+    const h3 = document.createElement("h3");
+    h3.textContent = "Error";
+    const pre = document.createElement("pre");
+    pre.className = "code-view";
+    pre.textContent = a.structural_errors[0];
+    block.append(h3, pre);
+    return block;
   }
-  bits.push(a.structural_ok ? "structural ok" : "structural failed");
-  if (a.content_checked) bits.push(a.content_ok ? "content ok" : "content failed");
-  const passed = a.structural_ok && (!a.content_checked || a.content_ok);
-  const errs = [...(a.structural_errors || []), ...(a.content_errors || [])];
-  let line = `Attempt ${a.attempt}: ${passed ? "passed" : "failed"} (${bits.join(", ")})`;
-  if (!passed && errs.length) line += "\n  " + errs.join("\n  ");
-  return line;
+
+  const ranContent = a.content_checked;
+  const rulesHeader = document.createElement("h3");
+  rulesHeader.textContent = `Rules checked — structural${ranContent ? " + content" : ""}`;
+  const rulesPre = document.createElement("pre");
+  rulesPre.className = "code-view";
+  let rulesText = (window.STRUCTURAL_RULES || []).map((r, i) => `${i + 1}. ${r}`).join("\n");
+  if (ranContent) {
+    rulesText += "\n\ncontent (model call against the student's own answers):\n" +
+      (window.CONTENT_RUBRIC || []).map((r, i) => `${i + 1}. ${r}`).join("\n") +
+      `\n\n${window.CONTENT_EXCLUSION || ""}`;
+  } else if (!a.structural_ok) {
+    rulesText += "\n\ncontent check: skipped — structural check failed first";
+  }
+  rulesPre.textContent = rulesText;
+  block.append(rulesHeader, rulesPre);
+
+  if (a.report_json) {
+    const jsonHeader = document.createElement("h3");
+    jsonHeader.textContent = "JSON validated";
+    const jsonPre = document.createElement("pre");
+    jsonPre.className = "json-view";
+    jsonPre.textContent = JSON.stringify(a.report_json, null, 2);
+    block.append(jsonHeader, jsonPre);
+  }
+
+  const resultHeader = document.createElement("h3");
+  resultHeader.textContent = "Result";
+  const resultPre = document.createElement("pre");
+  resultPre.className = "json-view";
+  const lines = [`structural: ${a.structural_ok ? "ok" : "failed"}`];
+  (a.structural_errors || []).forEach((e) => lines.push(`  - ${e}`));
+  if (ranContent) {
+    lines.push(`content: ${a.content_ok ? "ok" : "failed"}`);
+    (a.content_errors || []).forEach((e) => lines.push(`  - ${e}`));
+  }
+  resultPre.textContent = lines.join("\n");
+  block.append(resultHeader, resultPre);
+
+  return block;
 }
 
 rows.addEventListener("click", (e) => {
@@ -150,48 +220,20 @@ rows.addEventListener("click", (e) => {
       detailPanel.style.display = "block";
 
       const attempts = entry.attempts || [];
-      const lines = [];
-      lines.push(`Overall: ${entry.status === "error" ? "error" : (entry.passed ? "passed" : "failed")}`);
+      const overall = entry.status === "error" ? "error" : (entry.passed ? "passed" : "failed");
+      const metaBits = [`<span>Overall: <b>${overall}</b></span>`];
       if (attempts.length > 1) {
-        lines.push(`Resolved after ${attempts.length} of up to ${window.VALIDATION_RETRY_CAP} attempts.`);
+        metaBits.push(`<span>Resolved after <b>${attempts.length}</b> of up to <b>${window.VALIDATION_RETRY_CAP}</b> attempts</span>`);
       }
-      lines.push("");
-      lines.push(`Structural check: ${entry.structural_ok ? "ok" : "failed"}`);
-      (entry.structural_errors || []).forEach((err) => lines.push(`  - ${err}`));
-      lines.push("");
-      if (entry.content_checked) {
-        lines.push(`Content/accuracy check: ${entry.content_ok ? "ok" : "failed"}`);
-        (entry.content_errors || []).forEach((err) => lines.push(`  - ${err}`));
-      } else if (entry.structural_errors && entry.structural_errors.length) {
-        lines.push("Content/accuracy check: skipped — structural check failed first");
-      } else if (entry.status !== "error") {
-        lines.push("Content/accuracy check: not available — source answers were not " +
-          "saved for this batch (generated before this check existed). Regenerate " +
-          "this batch to enable it.");
+      if (entry.status === "error") {
+        metaBits.push(`<span>${escapeHtml((entry.structural_errors || [])[0] || "report not found")}</span>`);
+      } else if (!entry.content_checked && !(entry.structural_errors || []).length) {
+        metaBits.push(`<span>Content check not available — source answers weren't saved for this batch</span>`);
       }
-      detailSummary.textContent = lines.join("\n");
+      detailMeta.innerHTML = metaBits.join("");
 
-      if (attempts.length > 1) {
-        const header = document.createElement("p");
-        header.className = "section-label";
-        header.textContent = "attempt history";
-        const pre = document.createElement("pre");
-        pre.className = "json-view";
-        pre.textContent = attempts.map(attemptLine).join("\n\n");
-        detailAttempts.replaceChildren(header, pre);
-      } else {
-        detailAttempts.replaceChildren();
-      }
-
-      if (entry.report_json) {
-        detailJsonLabel.style.display = "";
-        detailJson.style.display = "";
-        detailJson.textContent = JSON.stringify(entry.report_json, null, 2);
-      } else {
-        detailJsonLabel.style.display = "none";
-        detailJson.style.display = "none";
-        detailJson.textContent = "";
-      }
+      detailAttempts.innerHTML = "";
+      attempts.forEach((a, i) => detailAttempts.appendChild(attemptBlock(a, i)));
 
       detailPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
     });

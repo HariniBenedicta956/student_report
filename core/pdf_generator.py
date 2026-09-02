@@ -98,6 +98,8 @@ S_PRIORITY_BODY = ParagraphStyle("PriorityBody", parent=_styles["Normal"],
                                   fontSize=9.5, leading=14)
 S_FOOTER = ParagraphStyle("Footer", parent=_styles["Normal"], textColor=TEXT_MUTED,
                            fontSize=7.5, leading=11)
+S_STUDENT_NAME = ParagraphStyle("StudentName", parent=_styles["Normal"], textColor=TEXT_MUTED,
+                                 fontName="Helvetica-Bold", fontSize=10.5, leading=14)
 
 
 def _esc(text):
@@ -205,13 +207,18 @@ def _action_box(text):
     return table
 
 
-def _page_header(title, page_label, issued=None, title_style=S_TITLE):
+def _page_header(title, page_label, issued=None, title_style=S_TITLE, student_name=None):
     story = [
         Paragraph(f"[ {_esc(PROGRAMME_EYEBROW)} ]", S_EYEBROW),
         Spacer(1, 5),
         Paragraph(_esc(title), title_style),
-        Spacer(1, 7),
     ]
+    # Rendered directly from identity, not left to the AI's intro_message to
+    # mention -- the name on the cover no longer depends on the model choosing
+    # to include it in generated text.
+    if student_name:
+        story += [Spacer(1, 3), Paragraph(f"Prepared for {_esc(student_name)}", S_STUDENT_NAME)]
+    story.append(Spacer(1, 7))
     right = Paragraph(f"Issued {_esc(issued)}", S_ISSUED) if issued else ""
     row = Table([[Paragraph(page_label, S_PAGENUM), right]],
                  colWidths=[CONTENT_WIDTH * 0.5, CONTENT_WIDTH * 0.5])
@@ -347,7 +354,8 @@ def generate_pdf(identity, report_json, output_path):
 
     # ---------------------------------------------------------------- page 1
     story += _page_header("Personal Learning Growth Report", "PAGE 1 OF 2",
-                           issued=date.today().strftime("%d %B %Y"))
+                           issued=date.today().strftime("%d %B %Y"),
+                           student_name=(identity or {}).get("name"))
 
     intro = report_json.get("intro_message")
     if intro:

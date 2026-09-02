@@ -48,7 +48,7 @@ def _extract_metrics(data):
     }
 
 
-def _call_host(host, model, messages):
+def _call_host(host, model, messages, json_schema=None):
     # stream=True -- with stream=False the connection sits completely silent (no
     # bytes either direction) for the entire prompt-eval + generation time, which
     # for our payload size is 100-200+ seconds. That's well past the idle-connection
@@ -63,7 +63,17 @@ def _call_host(host, model, messages):
             "model": model,
             "messages": messages,
             "stream": True,
-            "format": "json",
+            # A real JSON-schema object here (not just the string "json") gets Ollama
+            # to constrain token generation itself -- grammar-sampled so the model
+            # cannot emit a missing required field, a wrong type, or a tier value
+            # outside the four allowed labels. That is the single biggest lever on
+            # the first-attempt structural pass rate: those were exactly the most
+            # common validate_structure() failures before this, and schema-
+            # constrained decoding makes them impossible by construction rather than
+            # caught after the fact. Falls back to generic JSON-mode (valid JSON,
+            # no shape guarantee) for calls that don't pass a schema -- e.g. the
+            # content validator, whose {"verdict", "errors"} shape doesn't need it.
+            "format": json_schema if json_schema is not None else "json",
             # qwen3.5:4b is a hybrid-thinking model: by default it emits a hidden
             # chain-of-thought into a SEPARATE "thinking" field before (and instead
             # of, once num_predict runs out) the actual answer in "content". Verified
@@ -205,7 +215,7 @@ def probe_capacity(hosts=None):
     return max(sum(machines.values()), 1), detail
 
 
-def generate_raw(messages, model=None, hosts=None):
+def generate_raw(messages, model=None, hosts=None, json_schema=None):
     """
     Send chat messages to the first reachable Ollama host.
     Returns (content, metrics, host) -- metrics is Ollama's own token/timing counters,
@@ -213,12 +223,15 @@ def generate_raw(messages, model=None, hosts=None):
 
     hosts overrides the order tried, so each queue worker can prefer a different
     server and spread load instead of every worker starting at the same one.
+
+    json_schema, if given, is passed through as Ollama's `format` -- see
+    _call_host for why that matters more than it looks.
     """
     model = model or config.get_active_ollama_model()
     last_error = None
     for host in (hosts or config.OLLAMA_HOSTS):
         try:
-            data = _call_host(host, model, messages)
+            data = _call_host(host, model, messages, json_schema=json_schema)
             return data["message"]["content"], _extract_metrics(data), host
         except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
             log.warning("Ollama host %s failed (%s): %s", host, _classify(exc), exc)
@@ -240,10 +253,17 @@ def _backoff_delay(attempt):
     return min(RETRY_BASE_DELAY_S * (2 ** (attempt - 1)), RETRY_MAX_DELAY_S)
 
 
-def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=None):
+def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=None,
+                   json_schema=None):
     """
     Calls Ollama's chat endpoint and parses the response as JSON, making a small
     number of quick attempts and then RAISING rather than looping forever.
+
+    json_schema, if given, is passed through to Ollama as the `format` field
+    instead of the generic "json" string -- constrains decoding to that exact
+    shape (required fields, types, enum values) rather than merely valid JSON.
+    Leave it unset for calls whose output isn't the report schema (e.g. the
+    content validator's {"verdict", "errors"} shape).
 
     The long retry loop lives in report_queue, not here. Retrying indefinitely inside
     this call would hold the calling worker for as long as the host stayed down, and
@@ -275,7 +295,8 @@ def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=
             else messages + [{"role": "user", "content": STRICT_JSON_REMINDER}]
         )
         try:
-            raw, metrics, host = generate_raw(attempt_messages, model=model, hosts=hosts)
+            raw, metrics, host = generate_raw(attempt_messages, model=model, hosts=hosts,
+                                               json_schema=json_schema)
         except OllamaUnavailableError as exc:
             error_type = getattr(exc, "error_type", "unreachable")
             detail = str(exc)

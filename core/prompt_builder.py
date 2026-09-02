@@ -90,6 +90,77 @@ Rules that matter:
     the description above.
 """.strip()
 
+# A real JSON Schema for the same shape _SCHEMA_REPORT describes in prose, passed
+# to Ollama's `format` field (core/ollama_client.py) instead of the generic "json"
+# string. Ollama grammar-samples generation against this, so a missing required
+# field, a wrong type, or a tier outside the four labels becomes something the
+# model literally cannot emit, rather than something caught after the fact by
+# app.py's validate_structure(). That is the direct lever on first-attempt
+# structural pass rate -- see refinedversion.md's "schema-constrained decoding".
+#
+# Deliberately narrow to the widely-supported JSON Schema subset (type,
+# properties, required, items, enum, additionalProperties) and skips length
+# constraints (minLength/minItems) -- older Ollama/llama.cpp builds don't
+# reliably grammar-sample those, and getting them wrong risks the whole call
+# failing outright. validate_structure() still enforces minimum lengths and
+# non-empty text as a Python-side safety net; this schema's job is only to make
+# the shape/type/enum failures structurally impossible, not to replace that check.
+_CARD_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "headline": {"type": "string"},
+        "body": {"type": "string"},
+        "action": {"type": "string"},
+    },
+    "required": ["headline", "body"],
+    "additionalProperties": False,
+}
+_FOCUS_BLINDSPOT_ITEM_SCHEMA = {
+    **_CARD_ITEM_SCHEMA,
+    "required": ["headline", "body", "action"],
+}
+REPORT_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intro_message": {"type": "string"},
+        "dimensions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "tier": {"type": "string", "enum": list(TIERS)},
+                },
+                "required": ["name", "description", "tier"],
+                "additionalProperties": False,
+            },
+        },
+        "strong": {"type": "array", "items": _CARD_ITEM_SCHEMA},
+        "focus": {"type": "array", "items": _FOCUS_BLINDSPOT_ITEM_SCHEMA},
+        "blindspot": {"type": "array", "items": _FOCUS_BLINDSPOT_ITEM_SCHEMA},
+        "single_priority": {
+            "type": "object",
+            "properties": {
+                "headline": {"type": "string"},
+                "body": {"type": "string"},
+            },
+            "required": ["headline", "body"],
+            "additionalProperties": False,
+        },
+    },
+    # blindspot excluded on purpose -- the prompt says to include one only when
+    # genuinely evidenced, so its absence is a legitimate, deliberate choice, not
+    # a structural failure. strong/focus have no such carve-out, and omitting
+    # them entirely was observed live (no schema constraint stopped it, since
+    # they weren't required here before): app.py's STUDY_REQUIRED_FIELDS agrees
+    # with this list so the same shape is enforced both at decode time and by
+    # validate_structure() afterward.
+    "required": ["intro_message", "dimensions", "single_priority", "strong", "focus"],
+    "additionalProperties": False,
+}
+
+
 _SCHEMA_INSTRUCTION_NOTE = """
 The report requester's instruction ABOVE steers the CONTENT of these fields -- what
 to emphasise, which dimensions to pick, the tone and depth of the writing. It does

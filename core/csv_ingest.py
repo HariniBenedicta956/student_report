@@ -99,6 +99,12 @@ def parse_csv(file_bytes, mapping):
     }
     ignored_real_columns.discard(None)
 
+    # Denominator for completion_pct below: how many mapped questions this CSV
+    # actually has columns for -- not the mapping's full question count, which
+    # would be wrong if a different export drops or renames a column. Skipped
+    # rather than raised on (parse_csv is used against test/partial exports too).
+    total_mapped = len(mapped_cols)
+
     students = []
     for row in reader:
         identity = {
@@ -148,10 +154,14 @@ def parse_csv(file_bytes, mapping):
             else:
                 unmapped.append({"question": column, "answer": answer})
 
+        answered = sum(len(questions) for questions in sections.values())
+        completion_pct = round(answered / total_mapped * 100, 1) if total_mapped else 0.0
+
         students.append({
             "identity": identity,
             "sections": sections,
             "unmapped": unmapped,
+            "completion_pct": completion_pct,
         })
 
     return students

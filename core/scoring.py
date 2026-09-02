@@ -33,3 +33,17 @@ def compute_section_hints(sections):
         else:
             hints[section_key] = None
     return hints
+
+
+def compute_overall_score(sections):
+    """
+    Averages the per-section hints from compute_section_hints into one 0-100
+    figure -- used only as an optional eligibility signal (see Sync Eligibility
+    on Screen 1), not fed to the AI, which gets the per-section hints directly.
+    Returns None if no section produced a hint (e.g. every question in this
+    student's row was multi-select or free text).
+    """
+    scored = [v for v in compute_section_hints(sections).values() if v is not None]
+    if not scored:
+        return None
+    return round(sum(scored) / len(scored), 1)

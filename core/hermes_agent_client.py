@@ -16,7 +16,8 @@ from core.ollama_client import OllamaUnavailableError
 log = logging.getLogger(__name__)
 
 
-def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=None):
+def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=None,
+                   json_schema=None):
     """Route all Qwen generation through the in-process Hermes orchestration layer."""
     return ollama_client.generate_json(
         messages,
@@ -24,6 +25,7 @@ def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=
         on_retry=on_retry,
         max_attempts=max_attempts,
         hosts=hosts,
+        json_schema=json_schema,
     )
 
 
