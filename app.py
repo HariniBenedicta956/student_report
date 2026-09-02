@@ -335,10 +335,15 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
             )
             prompt_code = execution_trace.get_code(prompt_builder, "build_advice_messages")
         else:
-            messages = prompt_builder.build_messages(
-                student_record, mapping, instructions_text, question_bank
+            # This is step 1 of 2 -- what actually goes out first for a report
+            # request now (see hermes_agent_client.generate_report_two_step).
+            # Step 2's messages depend on step 1's real result, so they can't be
+            # shown here; they're attached to the "ai_processing" step instead,
+            # once step 1 has actually run.
+            messages = prompt_builder.build_evidence_extraction_messages(
+                student_record, mapping, question_bank
             )
-            prompt_code = execution_trace.get_code(prompt_builder, "build_messages")
+            prompt_code = execution_trace.get_code(prompt_builder, "build_evidence_extraction_messages")
     execution_trace.set_step(
         trace, "build_prompt", "done",
         code=prompt_code,
@@ -414,29 +419,42 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
     t_stage = time.perf_counter()
     try:
         with perf_logging.timed(timings, "ai_call_s"):
-            result = hermes_agent_client.generate_json(
-                messages,
-                model=selected_model,
-                on_retry=_on_retry,
-                hosts=ctx.hosts if ctx else None,
-                # None for a QA-listing request -- build_advice_messages asks for a
-                # different, smaller shape (just advice text), not the report schema.
-                json_schema=None if is_qa_request else prompt_builder.REPORT_JSON_SCHEMA,
-            )
+            if is_qa_request:
+                # build_advice_messages asks for a different, smaller shape (just
+                # advice text), not the evidence-grounded report task -- single
+                # call, general temperature, no schema.
+                result = hermes_agent_client.generate_json(
+                    messages, model=selected_model, on_retry=_on_retry,
+                    hosts=ctx.hosts if ctx else None,
+                )
+            else:
+                result = hermes_agent_client.generate_report_two_step(
+                    student_record, mapping, instructions_text,
+                    question_bank=question_bank, model=selected_model,
+                    on_retry=_on_retry, hosts=ctx.hosts if ctx else None,
+                )
         report_json = result["parsed"]
         attempts = result["attempts"]
         ai_metrics = result["metrics"]
         raw_text = result.get("raw_text")
         host_used = result.get("host")
+        if not is_qa_request and result.get("extraction"):
+            # Step 2's actual messages, rebuilt (pure, no API call) from the real
+            # extraction that was used -- attached here since build_prompt above
+            # ran before step 1 produced anything to build them from.
+            ai_metrics = dict(ai_metrics or {})
+            ai_metrics["step2_narrative_messages"] = prompt_builder.build_narrative_messages(
+                result["extraction"], student_record, instructions_text)
     except ollama_client.OllamaUnavailableError as exc:
         # Deliberately propagated instead of falling back here. report_queue catches
         # it, requeues this student with backoff and hands the worker the next one --
         # so a student that cannot be generated right now delays only itself. The
         # trace is left showing exactly where and why it stopped.
         error_type = getattr(exc, "error_type", "unreachable")
+        gen_func = "generate_json" if is_qa_request else "generate_report_two_step"
         execution_trace.set_step(
             trace, "send_to_hermes", "error",
-            code=execution_trace.get_code(hermes_agent_client, "generate_json"),
+            code=execution_trace.get_code(hermes_agent_client, gen_func),
             input_data=hermes_request_info,
             output_data={"error": str(exc)},
             extra={"last_error_type": error_type,
@@ -445,7 +463,7 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
         )
         execution_trace.set_step(
             trace, "ai_processing", "error",
-            code=execution_trace.get_code(ollama_client, "generate_json"),
+            code=execution_trace.get_code(hermes_agent_client, gen_func),
             output_data={"error": str(exc)}, extra={"last_error_type": error_type},
             duration_s=time.perf_counter() - t_stage,
         )
@@ -454,13 +472,14 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
     ai_call_duration = time.perf_counter() - t_stage
     storage.update_student_progress(batch_id, student_id, "ai_call", note=None)
 
+    gen_func = "generate_json" if is_qa_request else "generate_report_two_step"
     retry_summary = dict(trace.get("send_to_hermes", {}).get("extra") or {})
     retry_summary.pop("retrying_in_s", None)
     if prior_failure:
         retry_summary.update(prior_failure)
     execution_trace.set_step(
         trace, "send_to_hermes", "done" if host_used else "error",
-        code=execution_trace.get_code(hermes_agent_client, "generate_json"),
+        code=execution_trace.get_code(hermes_agent_client, gen_func),
         input_data=hermes_request_info,
         output_data={"host_used": host_used} if host_used else {"error": failure_reason},
         # Carries the retry history forward onto the finished step, so the dashboard
@@ -470,7 +489,7 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
     )
     execution_trace.set_step(
         trace, "ai_processing", "done" if (report_json is not None or raw_text) else "error",
-        code=execution_trace.get_code(ollama_client, "generate_json"),
+        code=execution_trace.get_code(hermes_agent_client, gen_func),
         output_data={"attempts": attempts, "retries": max(attempts - 1, 0)},
         duration_s=ai_call_duration,
         extra=ai_metrics,
@@ -665,7 +684,7 @@ import argparse   # noqa: E402  -- study-only imports, kept with the study code
 import json       # noqa: E402
 import re         # noqa: E402
 import requests   # noqa: E402
-from collections import deque             # noqa: E402
+from collections import Counter, deque    # noqa: E402
 from datetime import datetime, timezone   # noqa: E402
 
 # --- study configuration ---------------------------------------------------
@@ -734,6 +753,9 @@ STRUCTURAL_VALIDATION_RULES = [
     f"Narrative text fields are at least {STUDY_MIN_TEXT_CHARS} characters "
     "(shorter reads as truncated, not a real answer).",
     f"Each dimension's tier is exactly one of: {', '.join(STUDY_ALLOWED_TIERS)}.",
+    "Each dimension cites evidence_refs: at least one real question id this "
+    "student actually has an answer for -- an empty, missing, or fabricated "
+    "citation fails here, in Python, before any model call.",
     "strong / focus / blindspot cards carry their required keys: "
     + "; ".join(f"{field} needs {', '.join(keys)}" for field, keys in STUDY_CARD_FIELDS.items())
     + " (blindspot may be an empty array; the others may not).",
@@ -769,7 +791,7 @@ def gpu_status():
 
 # --- step 1: structural validation -----------------------------------------
 
-def validate_structure(report_json, mapping, required_fields=None):
+def validate_structure(report_json, mapping, required_fields=None, valid_evidence_ids=None):
     """
     Step 1, pure Python, always runs before the model validator.
 
@@ -777,6 +799,10 @@ def validate_structure(report_json, mapping, required_fields=None):
     is the point -- "missing field: summary" and "score out of range: 142" are
     what get fed back into the retry prompt, so a vague message costs the model
     its only clue about what to fix.
+
+    valid_evidence_ids, when given (prompt_builder.valid_answer_ids), lets this
+    catch a fabricated or misattributed evidence_refs citation deterministically,
+    in Python, before spending a model call on the content validator at all.
     """
     errors = []
     if not isinstance(report_json, dict):
@@ -825,6 +851,26 @@ def validate_structure(report_json, mapping, required_fields=None):
                     errors.append(f"tier not an allowed value: {tier!r} at "
                                    f"dimensions[{i}] (allowed: "
                                    f"{list(STUDY_ALLOWED_TIERS)})")
+
+                refs = dim.get("evidence_refs")
+                if refs is None:
+                    errors.append(f"missing field: dimensions[{i}].evidence_refs")
+                elif not isinstance(refs, list):
+                    errors.append(f"wrong type: dimensions[{i}].evidence_refs is "
+                                   f"{type(refs).__name__}, expected array")
+                elif not refs:
+                    errors.append(f"empty array: dimensions[{i}].evidence_refs -- "
+                                   f"must cite at least one question id")
+                else:
+                    for ref in refs:
+                        if not isinstance(ref, str) or not ref.strip():
+                            errors.append(f"invalid entry in dimensions[{i}].evidence_refs: "
+                                           f"{ref!r}, expected a non-empty question id string")
+                        elif valid_evidence_ids is not None and ref not in valid_evidence_ids:
+                            errors.append(
+                                f"evidence_misattribution: dimensions[{i}].evidence_refs "
+                                f"cites {ref!r}, which is not a real question id this "
+                                f"student has an answer for")
 
     # --- the page 2 card arrays ----------------------------------------------
     for field, required_keys in STUDY_CARD_FIELDS.items():
@@ -883,16 +929,25 @@ def validate_structure(report_json, mapping, required_fields=None):
 # "what each check verifies" panel the literal rubric text rather than a
 # paraphrase that could quietly drift out of sync with what the model is
 # actually told.
+#
+# The tier-criteria line is built from prompt_builder.TIER_CRITERIA rather than
+# restated by hand -- whatever bar the generator was given for a tier is
+# exactly what the validator checks it against, not an independently-worded
+# paraphrase free to drift out of sync with it.
+_TIER_CRITERIA_LINES = "\n".join(
+    f"  * {tier}: {prompt_builder.TIER_CRITERIA[tier]}" for tier in prompt_builder.TIERS
+)
+
 CONTENT_VALIDATION_RUBRIC = [
     "Unsupported claims -- every claim in REPORT must trace to a specific answer "
     "in SOURCE_ANSWERS. Flag anything asserted, implied, or generalized that the "
     "source does not specifically support (including skills, actions, experience "
     "or achievements the student did not actually report).",
     "Tier-criteria match -- each dimension's assigned tier (Strength / Developing "
-    "/ Focus Required / Blind Spot) must follow from a specific, stated reason "
-    "grounded in the answers for that dimension, not a generic or default-feeling "
-    "assignment. Flag a tier whose rationale isn't tied to something specific in "
-    "that dimension's own answers.",
+    "/ Focus Required / Blind Spot) must satisfy the SAME criterion the generator "
+    "was given for that tier:\n" + _TIER_CRITERIA_LINES + "\n  Flag a tier that "
+    "does not meet its own criterion above (e.g. Strength from a single answer, "
+    "or Blind Spot without two specifically conflicting answers).",
     "Non-generic dimensions -- no dimension's name or description may be generic "
     "enough to apply interchangeably to a different student. Flag a dimension "
     "that reads as boilerplate career advice rather than something this "
@@ -909,22 +964,52 @@ CONTENT_VALIDATION_EXCLUSION_LINE = (
     "and non-actionable)."
 )
 
-# Schema-constrains the validator's OWN output shape ({"verdict", "errors"}),
-# not the report it's judging -- fixes "validator did not return a usable
-# verdict" (observed live: without this, the validator's generate_json call was
-# accidentally sharing _study_generate_agent/_direct with report generation and
-# getting schema-constrained into the REPORT shape instead, which obviously
-# cannot come back as a verdict). This only makes the verdict itself reliably
-# parseable; it has no effect on what the validator is asked to judge or how
-# strict the rubric is -- the content check stays exactly as mandatory and
-# exactly as strict as it already was.
+# The fixed set of violation categories the validator classifies every failure
+# into -- lets a batch be summarized by "42 tier_contradiction, 3
+# evidence_misattribution" instead of grouping free prose by rough text
+# similarity (see _compute_failure_summary). Each maps to the rubric above:
+#   unsupported_claim        -- rubric #1 (unsupported) and #3 (generic enough
+#                                to be unsupported by anything specific)
+#   tier_contradiction        -- rubric #2 (tier doesn't meet its own criterion)
+#   evidence_misattribution   -- a cited evidence_ref is real (already checked
+#                                by validate_structure) but doesn't actually
+#                                say what the claim asserts
+#   unsupported_action        -- rubric #4 (single_priority or an "action"
+#                                field that's vague/generic rather than tied to
+#                                a specific evidenced gap)
+CONTENT_VIOLATION_CATEGORIES = (
+    "unsupported_claim", "tier_contradiction", "evidence_misattribution", "unsupported_action",
+)
+
+# Schema-constrains the validator's OWN output shape, not the report it's
+# judging -- fixes "validator did not return a usable verdict" (observed live:
+# without this, the validator's generate_json call was accidentally sharing
+# _study_generate_agent/_direct with report generation and getting schema-
+# constrained into the REPORT shape instead, which obviously cannot come back
+# as a verdict). "status"/"violations" (rather than the old "verdict"/"errors")
+# and each violation's "category" is what actually lets a batch be grouped and
+# summarized by category instead of raw text -- this only makes the verdict
+# reliably parseable and structured; it has no effect on how strict the
+# rubric is -- the content check stays exactly as mandatory as it already was.
 CONTENT_VALIDATION_VERDICT_SCHEMA = {
     "type": "object",
     "properties": {
-        "verdict": {"type": "string", "enum": ["pass", "fail"]},
-        "errors": {"type": "array", "items": {"type": "string"}},
+        "status": {"type": "string", "enum": ["pass", "fail"]},
+        "violations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "enum": list(CONTENT_VIOLATION_CATEGORIES)},
+                    "dimension": {"type": "string"},
+                    "detail": {"type": "string"},
+                },
+                "required": ["category", "dimension", "detail"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["verdict", "errors"],
+    "required": ["status", "violations"],
     "additionalProperties": False,
 }
 
@@ -944,16 +1029,30 @@ def build_validation_messages(report_json, student_record, mapping, question_ban
         "",
         "You are given SOURCE_ANSWERS (what the student actually answered) and "
         "REPORT (what was generated about them). REPORT is qualitative -- "
-        "dimensions with a tier label, not a numeric score. Check ONLY these "
-        "four things:",
+        "dimensions with a tier label, not a numeric score. Each dimension "
+        "carries evidence_refs: the question id(s) the generator cited as the "
+        "basis for it -- already checked to be real ids this student answered, "
+        "so your job is judging whether the answer(s) at those ids actually "
+        "support the dimension's description and tier, not re-scanning all of "
+        "SOURCE_ANSWERS from scratch. Check ONLY these four things:",
         *[f"{i}. {item}" for i, item in enumerate(CONTENT_VALIDATION_RUBRIC, start=1)],
         "",
         CONTENT_VALIDATION_EXCLUSION_LINE,
         "",
-        'Respond with ONLY this JSON: {"verdict": "pass" | "fail", "errors": ["..."]}',
-        'On pass, "errors" must be an empty array. On fail, each entry is one short, '
-        "specific sentence naming the offending claim, dimension/tier, or generic "
-        "phrase, and which of the four checks it violates.",
+        'Respond with ONLY this JSON: {"status": "pass" | "fail", "violations": [...]}',
+        '. On pass, "violations" must be an empty array. On fail, each violation is '
+        '{"category", "dimension", "detail"}:',
+        f'  * "category" -- exactly one of: {", ".join(CONTENT_VIOLATION_CATEGORIES)}.',
+        '  * "dimension" -- the dimension name this violates, or the field name '
+        '(e.g. "single_priority", "strong[0]") if it is not dimension-specific.',
+        '  * "detail" -- one short, specific sentence naming the offending claim.',
+        "Use unsupported_claim for a claim, description, or dimension that isn't "
+        "grounded in the cited evidence (including one generic enough to belong to "
+        "any student). Use tier_contradiction when the tier doesn't meet its own "
+        "TIER CRITERIA. Use evidence_misattribution when a cited evidence_ref is "
+        "real but doesn't actually say what the claim asserts. Use "
+        "unsupported_action for single_priority or an \"action\" field that is "
+        "vague or generic rather than tied to a specific evidenced gap.",
     ])
     payload = {
         "SOURCE_ANSWERS": json.loads(
@@ -967,9 +1066,17 @@ def build_validation_messages(report_json, student_record, mapping, question_ban
     ]
 
 
+def _violation(category, dimension, detail):
+    return {"category": category, "dimension": dimension or "", "detail": detail}
+
+
 def validate_with_model(report_json, student_record, mapping, question_bank, hosts=None):
     """
-    Step 2. Returns (errors, elapsed_s, raw_text). Empty errors means it passed.
+    Step 2. Returns (violations, elapsed_s, raw_text). Empty violations means
+    it passed. Each violation is {"category", "dimension", "detail"} (see
+    CONTENT_VIOLATION_CATEGORIES) -- structured so a batch can be grouped and
+    summarized by category (_compute_failure_summary) instead of by rough
+    text-similarity over free prose.
 
     Runs on STUDY_VALIDATION_USES_AGENT no matter which path generation used --
     --mode changes generation only, so the validator stays a constant across both
@@ -982,18 +1089,108 @@ def validate_with_model(report_json, student_record, mapping, question_bank, hos
             messages, STUDY_VALIDATION_MODEL, STUDY_VALIDATION_USES_AGENT, hosts,
             json_schema=CONTENT_VALIDATION_VERDICT_SCHEMA)
     except Exception as exc:  # noqa: BLE001 -- a dead validator is a result, not a crash
-        return [f"validator call failed: {exc}"], round(time.perf_counter() - t0, 3), None
+        return ([_violation("unsupported_claim", "", f"validator call failed: {exc}")],
+                round(time.perf_counter() - t0, 3), None)
     elapsed = round(time.perf_counter() - t0, 3)
 
     parsed = ollama_client._try_parse_json(raw)
-    if not isinstance(parsed, dict) or "verdict" not in parsed:
-        return ["validator did not return a usable verdict"], elapsed, raw
-    if str(parsed.get("verdict", "")).strip().lower() == "pass":
+    if not isinstance(parsed, dict) or "status" not in parsed:
+        return ([_violation("unsupported_claim", "", "validator did not return a usable verdict")],
+                elapsed, raw)
+    if str(parsed.get("status", "")).strip().lower() == "pass":
         return [], elapsed, raw
-    errors = parsed.get("errors") or ["validator returned fail with no reason given"]
-    if isinstance(errors, str):
-        errors = [errors]
-    return [str(e) for e in errors], elapsed, raw
+    raw_violations = parsed.get("violations") or []
+    if isinstance(raw_violations, str):
+        raw_violations = [{"category": "unsupported_claim", "dimension": "", "detail": raw_violations}]
+    violations = []
+    for v in raw_violations:
+        if isinstance(v, dict):
+            category = v.get("category") if v.get("category") in CONTENT_VIOLATION_CATEGORIES else "unsupported_claim"
+            violations.append(_violation(category, v.get("dimension"), v.get("detail") or "(no detail given)"))
+        else:
+            violations.append(_violation("unsupported_claim", "", str(v)))
+    if not violations:
+        violations = [_violation("unsupported_claim", "", "validator returned fail with no violations given")]
+    return violations, elapsed, raw
+
+
+# --- step 3: recurring-failure summary (only once every retry is exhausted) -
+
+FAILURE_SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {"summary": {"type": "string"}},
+    "required": ["summary"],
+    "additionalProperties": False,
+}
+
+
+def build_failure_summary_messages(attempts_log):
+    """
+    A student's failed-reports list entry needs one short explanation of why,
+    not the full per-attempt violation history repeated -- that detail stays
+    available on click (see validate_results.html), this is just the headline.
+    """
+    lines = []
+    for a in attempts_log:
+        for e in a.get("structural_errors") or []:
+            lines.append(f"attempt {a['attempt']} (structural): {e}")
+        for v in a.get("content_violations") or []:
+            lines.append(f"attempt {a['attempt']} ({v['category']}, dimension "
+                          f"'{v['dimension'] or '(general)'}'): {v['detail']}")
+    history_text = "\n".join(lines) if lines else "(no specific errors recorded)"
+    system = "\n".join([
+        "You are summarizing why a generated student report failed validation "
+        "across multiple attempts, for a batch owner's failed-reports list.",
+        "Write ONLY the core RECURRING issue -- the pattern common across "
+        "attempts (e.g. 'tiers keep getting assigned from single-answer "
+        "evidence' or 'claims keep going beyond what the cited answer says'), "
+        "not a list of every individual violation. If the attempts failed for "
+        "genuinely different, unrelated reasons, say that instead of forcing "
+        "one pattern.",
+        "2-3 sentences maximum. Plain text, no markdown, no bullet points, no "
+        "restating of every attempt.",
+        'Respond with ONLY this JSON: {"summary": "..."}',
+    ])
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"FAILED ATTEMPTS:\n{history_text}"},
+    ]
+
+
+def _fallback_failure_summary(attempts_log):
+    """No-model-call fallback -- used only if the summarizer call itself fails,
+    since a dead summarizer shouldn't also block the batch from finishing."""
+    tags = []
+    for a in attempts_log:
+        for e in a.get("structural_errors") or []:
+            tags.append("structural: " + _error_signature(e))
+        for v in a.get("content_violations") or []:
+            tags.append(v.get("category") or "uncategorized")
+    if not tags:
+        return "Failed validation across all attempts; no specific error was recorded."
+    common, count = Counter(tags).most_common(1)[0]
+    return (f"Failed validation across {len(attempts_log)} attempt(s), most often on: "
+            f"{common} ({count} occurrence(s)).")
+
+
+def summarize_recurring_failure(attempts_log, hosts=None):
+    """
+    Step 3, only reached once a student exhausts every retry without passing
+    (see _run_batch_validation). One short model call over the whole failure
+    history -- 2-3 lines naming the recurring pattern, not the full violation
+    list repeated for a second time.
+    """
+    messages = build_failure_summary_messages(attempts_log)
+    try:
+        raw, _host, _metrics = study_generate(
+            messages, STUDY_VALIDATION_MODEL, STUDY_VALIDATION_USES_AGENT, hosts,
+            json_schema=FAILURE_SUMMARY_SCHEMA)
+        parsed = ollama_client._try_parse_json(raw)
+        if isinstance(parsed, dict) and str(parsed.get("summary") or "").strip():
+            return str(parsed["summary"]).strip()
+    except Exception as exc:  # noqa: BLE001 -- a dead summarizer still needs some text
+        log.warning("failure summary call failed: %s", exc)
+    return _fallback_failure_summary(attempts_log)
 
 
 # --- on-demand validation for an already-generated batch (web UI) ----------
@@ -1056,21 +1253,37 @@ def _error_signature(error_text):
 def _compute_failure_summary(students):
     """
     Groups every currently-failed student (done or error status, not passed) by
-    _error_signature, most-frequent first -- the "why is this batch failing"
+    failure signature, most-frequent first -- the "why is this batch failing"
     view refinedversion.md describes, computed fresh from whatever has finished
     so far rather than stored separately and risking drifting out of sync.
+
+    Structural errors are grouped by _error_signature (a deterministic string
+    from validate_structure, e.g. "missing field: dimensions[].tier"). Content
+    violations are grouped by their own "category" directly (see
+    CONTENT_VIOLATION_CATEGORIES) rather than by fuzzy text similarity -- the
+    validator now returns a real category instead of free prose to
+    approximate one from.
     """
     groups = {}
+
+    def _bump(signature, student_id):
+        group = groups.setdefault(signature, {"signature": signature, "count": 0, "student_ids": []})
+        if student_id not in group["student_ids"]:
+            group["student_ids"].append(student_id)
+            group["count"] += 1
+
     for s in students:
         if s.get("status") not in ("done", "error") or s.get("passed"):
             continue
-        errors = (s.get("structural_errors") or []) + (s.get("content_errors") or [])
-        for err in errors or ["(no error text recorded)"]:
-            sig = _error_signature(err)
-            group = groups.setdefault(sig, {"signature": sig, "count": 0, "student_ids": []})
-            if s["student_id"] not in group["student_ids"]:
-                group["student_ids"].append(s["student_id"])
-                group["count"] += 1
+        sid = s["student_id"]
+        structural = s.get("structural_errors") or []
+        violations = s.get("content_violations") or []
+        for err in structural:
+            _bump(_error_signature(err), sid)
+        for v in violations:
+            _bump(f"content: {v.get('category') or 'uncategorized'}", sid)
+        if not structural and not violations:
+            _bump("(no error text recorded)", sid)
     return sorted(groups.values(), key=lambda g: -g["count"])
 
 
@@ -1182,7 +1395,7 @@ def _run_batch_validation(batch_id, student_ids=None):
         except FileNotFoundError:
             entry.update(status="error", passed=False, structural_ok=None,
                          structural_errors=["report JSON not found on disk"],
-                         content_checked=False, content_ok=None, content_errors=[],
+                         content_checked=False, content_ok=None, content_violations=[],
                          attempts=[])
             processed += 1
             consecutive_failures += 1
@@ -1209,25 +1422,29 @@ def _run_batch_validation(batch_id, student_ids=None):
         report_content = {k: v for k, v in report_json.items() if not k.startswith("_")}
         raw_text = json.dumps(report_content, ensure_ascii=False)
 
+        valid_evidence_ids = (
+            prompt_builder.valid_answer_ids(record, question_bank) if record else None
+        )
         attempts_log = []
         attempt = 0
         while True:
             attempt += 1
-            structural_errors = validate_structure(report_content, mapping)
-            content_errors, content_checked = [], False
+            structural_errors = validate_structure(
+                report_content, mapping, valid_evidence_ids=valid_evidence_ids)
+            content_violations, content_checked = [], False
             if not structural_errors and record is not None:
-                content_errors, _elapsed, _raw = validate_with_model(
+                content_violations, _elapsed, _raw = validate_with_model(
                     report_content, record, mapping, question_bank)
                 content_checked = True
-            passed = not structural_errors and (not content_checked or not content_errors)
+            passed = not structural_errors and (not content_checked or not content_violations)
 
             attempts_log.append({
                 "attempt": attempt,
                 "structural_ok": not structural_errors,
                 "structural_errors": structural_errors,
                 "content_checked": content_checked,
-                "content_ok": (not content_errors) if content_checked else None,
-                "content_errors": content_errors,
+                "content_ok": (not content_violations) if content_checked else None,
+                "content_violations": content_violations,
                 "report_json": report_content,
             })
             entry.update(attempts=attempts_log)
@@ -1240,20 +1457,26 @@ def _run_batch_validation(batch_id, student_ids=None):
             if passed or record is None or attempt >= VALIDATION_RETRY_CAP:
                 break
 
-            errors = structural_errors or content_errors
-            base_messages = prompt_builder.build_messages(
-                record, mapping, instructions_text, question_bank)
-            messages = _study_retry_messages(base_messages, raw_text, errors)
+            if structural_errors:
+                reasons = structural_errors
+            else:
+                # Structured violations, flattened into one line each for the
+                # retry prompt (still full regeneration -- see
+                # build_narrative_messages -- just now carrying real category/
+                # dimension labels instead of free prose alone).
+                reasons = [f"[{v['category']}] {v['dimension'] or '(general)'}: {v['detail']}"
+                           for v in content_violations]
             try:
-                result = hermes_agent_client.generate_json(
-                    messages, model=config.get_active_ollama_model(),
-                    json_schema=prompt_builder.REPORT_JSON_SCHEMA)
+                result = hermes_agent_client.generate_report_two_step(
+                    record, mapping, instructions_text, question_bank=question_bank,
+                    model=config.get_active_ollama_model(),
+                    retry_feedback={"previous_output": raw_text, "reasons": reasons})
             except Exception as exc:  # noqa: BLE001 -- recorded, then this student stops retrying
                 attempts_log.append({
                     "attempt": attempt + 1,
                     "structural_ok": False,
                     "structural_errors": [f"regeneration failed: {exc}"],
-                    "content_checked": False, "content_ok": None, "content_errors": [],
+                    "content_checked": False, "content_ok": None, "content_violations": [],
                     "report_json": None,
                 })
                 entry.update(attempts=attempts_log)
@@ -1270,7 +1493,7 @@ def _run_batch_validation(batch_id, student_ids=None):
             structural_errors=final["structural_errors"],
             content_checked=final["content_checked"],
             content_ok=final["content_ok"],
-            content_errors=final["content_errors"],
+            content_violations=final["content_violations"],
             report_json=final["report_json"],
             attempts=attempts_log,
         )
@@ -1282,6 +1505,13 @@ def _run_batch_validation(batch_id, student_ids=None):
             storage.save_student_report(batch_id, sid, final["report_json"])
             pdf_path = storage.student_pdf_path(batch_id, sid)
             pdf_generator.generate_pdf(record["identity"], final["report_json"], pdf_path)
+
+        # Only for a student who genuinely exhausted retries without passing --
+        # the failed-reports list gets one short recurring-issue line instead
+        # of needing to show (or the owner needing to read) the full
+        # per-attempt violation history to understand why this one failed.
+        if not entry["passed"]:
+            entry["recurring_issue_summary"] = summarize_recurring_failure(attempts_log)
 
         processed += 1
         consecutive_failures = 0 if entry["passed"] else consecutive_failures + 1
@@ -1366,7 +1596,7 @@ def batch_validate_status(batch_id):
 
 # --- generation call paths (agent vs direct) -------------------------------
 
-def study_generate(messages, model, use_agent, hosts=None, json_schema=None):
+def study_generate(messages, model, use_agent, hosts=None, json_schema=None, temperature=None):
     """
     Both paths use the same model; only how the call is made differs.
 
@@ -1375,14 +1605,16 @@ def study_generate(messages, model, use_agent, hosts=None, json_schema=None):
     validation (CONTENT_VALIDATION_VERDICT_SCHEMA), and those are two entirely
     different output shapes. Guessing one here previously caused exactly that
     bug: the validator's call inherited the report schema and its output
-    stopped parsing as a verdict at all.
+    stopped parsing as a verdict at all. temperature is the same story -- report
+    generation passes config.OLLAMA_GENERATION_TEMPERATURE, validation leaves it
+    unset (the general config.OLLAMA_TEMPERATURE default).
     """
     if use_agent:
-        return _study_generate_agent(messages, model, hosts, json_schema)
-    return _study_generate_direct(messages, model, hosts, json_schema)
+        return _study_generate_agent(messages, model, hosts, json_schema, temperature)
+    return _study_generate_direct(messages, model, hosts, json_schema, temperature)
 
 
-def _study_generate_agent(messages, model, hosts=None, json_schema=None):
+def _study_generate_agent(messages, model, hosts=None, json_schema=None, temperature=None):
     """
     Agent path: the same model through core.hermes_agent_client -- the Hermes
     agent's own retry/host-failover/schema-constrained-decoding, plus this
@@ -1390,12 +1622,12 @@ def _study_generate_agent(messages, model, hosts=None, json_schema=None):
     production report generation already uses.
     """
     result = hermes_agent_client.generate_json(
-        messages, model=model, hosts=hosts, json_schema=json_schema)
+        messages, model=model, hosts=hosts, json_schema=json_schema, temperature=temperature)
     raw = result.get("raw_text") or json.dumps(result.get("parsed"), ensure_ascii=False)
     return raw, result.get("host"), result.get("metrics")
 
 
-def _study_generate_direct(messages, model, hosts=None, json_schema=None):
+def _study_generate_direct(messages, model, hosts=None, json_schema=None, temperature=None):
     """
     Legacy direct-HTTP-to-Ollama path removed -- all Qwen calls stay in-process
     through hermes_agent_client now, same as the "agent" path. The two STUDY_PATHS
@@ -1403,7 +1635,7 @@ def _study_generate_direct(messages, model, hosts=None, json_schema=None):
     still works without a CLI-arg change elsewhere.
     """
     result = hermes_agent_client.generate_json(
-        messages, model=model, hosts=hosts, json_schema=json_schema)
+        messages, model=model, hosts=hosts, json_schema=json_schema, temperature=temperature)
     raw = result.get("raw_text") or json.dumps(result.get("parsed"), ensure_ascii=False)
     return raw, result.get("host"), result.get("metrics")
 
@@ -1500,14 +1732,16 @@ def run_bad_sample_check(valid_report, student_record, mapping, question_bank, h
     if field is None:
         return {"ran": False, "reason": "no valid report available to corrupt"}
 
-    structural = validate_structure(bad, mapping)
+    structural = validate_structure(
+        bad, mapping, valid_evidence_ids=prompt_builder.valid_answer_ids(student_record, question_bank))
     if structural:
         return {"ran": True, "corrupted_field": field, "injected": injected,
                 "caught": True, "caught_at": "step 1 (structural)",
                 "errors": structural}
 
-    errors, elapsed, _raw = validate_with_model(
+    violations, elapsed, _raw = validate_with_model(
         bad, student_record, mapping, question_bank, hosts)
+    errors = [f"[{v['category']}] {v['dimension'] or '(general)'}: {v['detail']}" for v in violations]
     return {"ran": True, "corrupted_field": field, "injected": injected,
             "caught": bool(errors), "caught_at": "step 2 (model)" if errors else None,
             "errors": errors, "validation_time_s": elapsed}
@@ -1580,7 +1814,8 @@ def run_validation_study(students, mapping, use_agent=None, instructions_text=""
         try:
             raw, host, metrics = study_generate(
                 messages, STUDY_GENERATION_MODEL, use_agent, hosts,
-                json_schema=prompt_builder.REPORT_JSON_SCHEMA)
+                json_schema=prompt_builder.REPORT_JSON_SCHEMA,
+                temperature=config.OLLAMA_GENERATION_TEMPERATURE)
             parsed = ollama_client._try_parse_json(raw)
             if parsed is None:
                 gen_error = "model output was not valid JSON"
@@ -1592,10 +1827,19 @@ def run_validation_study(students, mapping, use_agent=None, instructions_text=""
         if gen_error:
             structural_errors = [gen_error]
         else:
-            structural_errors = validate_structure(parsed, mapping)
+            structural_errors = validate_structure(
+                parsed, mapping,
+                valid_evidence_ids=prompt_builder.valid_answer_ids(cand["record"], question_bank))
             if not structural_errors:
-                validation_errors, val_s, _ = validate_with_model(
+                raw_violations, val_s, _ = validate_with_model(
                     parsed, cand["record"], mapping, question_bank, hosts)
+                # Flattened to strings here so everything downstream in this CLI
+                # study tool (_study_log, _study_retry_messages, cand["history"])
+                # keeps working on plain text, same as before validate_with_model
+                # started returning structured {category, dimension, detail}
+                # violations for the live web validator.
+                validation_errors = [f"[{v['category']}] {v['dimension'] or '(general)'}: {v['detail']}"
+                                      for v in raw_violations]
 
         errors = structural_errors or validation_errors
         passed = not errors

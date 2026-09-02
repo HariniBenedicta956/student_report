@@ -370,6 +370,7 @@ td.action-cell {
 
 .rubric-list li {
   margin-bottom: 6px;
+  white-space: pre-line;
 }
 
 .criteria-exclusion {

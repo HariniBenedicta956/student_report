@@ -74,8 +74,13 @@ function render(validation) {
     const cls = statusClass(entry);
     const showDots = entry.status === "pending" || entry.status === "running";
     const hasPdf = entry.status === "done" && entry.passed;
+    // The failed-reports list gets one short recurring-issue line here, not
+    // the full per-attempt violation history -- that stays behind "Details".
+    const failedSummary = entry.status === "done" && !entry.passed && entry.recurring_issue_summary
+      ? `<div class="meta" style="margin-top:2px;max-width:480px;white-space:normal">${escapeHtml(entry.recurring_issue_summary)}</div>`
+      : "";
     tr.innerHTML = `
-      <td class="name">${escapeHtml(entry.name || entry.student_id)}</td>
+      <td class="name">${escapeHtml(entry.name || entry.student_id)}${failedSummary}</td>
       <td class="status-cell"><span class="status ${cls}">${statusLabel(entry)}${showDots ? dots() : ""}</span></td>
       <td class="action-cell">
         <button class="link-btn detail-btn" data-student-id="${entry.student_id}" ${settled ? "" : "disabled"}>Details</button>
@@ -200,7 +205,9 @@ function attemptBlock(a, index) {
   (a.structural_errors || []).forEach((e) => lines.push(`  - ${e}`));
   if (ranContent) {
     lines.push(`content: ${a.content_ok ? "ok" : "failed"}`);
-    (a.content_errors || []).forEach((e) => lines.push(`  - ${e}`));
+    (a.content_violations || []).forEach((v) =>
+      lines.push(`  - [${v.category}] ${v.dimension || "(general)"}: ${v.detail}`)
+    );
   }
   resultPre.textContent = lines.join("\n");
   block.append(resultHeader, resultPre);

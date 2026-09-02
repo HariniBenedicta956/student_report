@@ -138,8 +138,16 @@ OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
 OLLAMA_NUM_PREDICT = int(os.environ.get("OLLAMA_NUM_PREDICT", "4096"))
 # Low temperature: this call needs reliably well-formed, instruction-following
-# JSON, not creative variety.
+# JSON, not creative variety. This is the default for every Ollama call.
 OLLAMA_TEMPERATURE = float(os.environ.get("OLLAMA_TEMPERATURE", "0.3"))
+
+# Report GENERATION specifically goes lower still than the 0.3 default -- this is
+# the call where the model has to stay tied to cited evidence (evidence_refs) and
+# not improvise beyond it; less sampling randomness means less room for it to
+# wander into an unsupported claim or a tier the evidence doesn't back. The
+# content validator and everything else keep the general OLLAMA_TEMPERATURE --
+# only report generation opts into this lower value (see its generate_json call).
+OLLAMA_GENERATION_TEMPERATURE = float(os.environ.get("OLLAMA_GENERATION_TEMPERATURE", "0.15"))
 
 UPLOAD_DIR = os.path.join(BASE_DIR, "data", "uploads")
 QUESTION_BANK_DIR = os.path.join(BASE_DIR, "data", "question_banks")

@@ -48,7 +48,7 @@ def _extract_metrics(data):
     }
 
 
-def _call_host(host, model, messages, json_schema=None):
+def _call_host(host, model, messages, json_schema=None, temperature=None):
     # stream=True -- with stream=False the connection sits completely silent (no
     # bytes either direction) for the entire prompt-eval + generation time, which
     # for our payload size is 100-200+ seconds. That's well past the idle-connection
@@ -71,8 +71,9 @@ def _call_host(host, model, messages, json_schema=None):
             # common validate_structure() failures before this, and schema-
             # constrained decoding makes them impossible by construction rather than
             # caught after the fact. Falls back to generic JSON-mode (valid JSON,
-            # no shape guarantee) for calls that don't pass a schema -- e.g. the
-            # content validator, whose {"verdict", "errors"} shape doesn't need it.
+            # no shape guarantee) for calls that don't pass a schema. The content
+            # validator has its own schema too (app.py's
+            # CONTENT_VALIDATION_VERDICT_SCHEMA, {"status", "violations"}).
             "format": json_schema if json_schema is not None else "json",
             # qwen3.5:4b is a hybrid-thinking model: by default it emits a hidden
             # chain-of-thought into a SEPARATE "thinking" field before (and instead
@@ -98,8 +99,9 @@ def _call_host(host, model, messages, json_schema=None):
                 # Lower temperature -- this call only needs reliably well-formed JSON
                 # that follows instructions, not creative variety, and a wandering/
                 # high-temp completion is more likely to produce something that fails
-                # to parse.
-                "temperature": config.OLLAMA_TEMPERATURE,
+                # to parse. Callers that need to go lower still (report generation,
+                # to stay tied to cited evidence) pass temperature explicitly.
+                "temperature": temperature if temperature is not None else config.OLLAMA_TEMPERATURE,
                 # Ollama defaults num_ctx to as little as 2048-4096 tokens unless told
                 # otherwise. Our system+user payload (schema + question bank + answers)
                 # runs 4000-5000+ tokens -- past a small default, Ollama silently
@@ -215,7 +217,7 @@ def probe_capacity(hosts=None):
     return max(sum(machines.values()), 1), detail
 
 
-def generate_raw(messages, model=None, hosts=None, json_schema=None):
+def generate_raw(messages, model=None, hosts=None, json_schema=None, temperature=None):
     """
     Send chat messages to the first reachable Ollama host.
     Returns (content, metrics, host) -- metrics is Ollama's own token/timing counters,
@@ -226,12 +228,16 @@ def generate_raw(messages, model=None, hosts=None, json_schema=None):
 
     json_schema, if given, is passed through as Ollama's `format` -- see
     _call_host for why that matters more than it looks.
+
+    temperature, if given, overrides config.OLLAMA_TEMPERATURE for this call only
+    (e.g. report generation goes lower -- see config.OLLAMA_GENERATION_TEMPERATURE).
     """
     model = model or config.get_active_ollama_model()
     last_error = None
     for host in (hosts or config.OLLAMA_HOSTS):
         try:
-            data = _call_host(host, model, messages, json_schema=json_schema)
+            data = _call_host(host, model, messages, json_schema=json_schema,
+                               temperature=temperature)
             return data["message"]["content"], _extract_metrics(data), host
         except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
             log.warning("Ollama host %s failed (%s): %s", host, _classify(exc), exc)
@@ -254,7 +260,7 @@ def _backoff_delay(attempt):
 
 
 def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=None,
-                   json_schema=None):
+                   json_schema=None, temperature=None):
     """
     Calls Ollama's chat endpoint and parses the response as JSON, making a small
     number of quick attempts and then RAISING rather than looping forever.
@@ -262,8 +268,11 @@ def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=
     json_schema, if given, is passed through to Ollama as the `format` field
     instead of the generic "json" string -- constrains decoding to that exact
     shape (required fields, types, enum values) rather than merely valid JSON.
-    Leave it unset for calls whose output isn't the report schema (e.g. the
-    content validator's {"verdict", "errors"} shape).
+    Leave it unset for a call whose output has no schema of its own to constrain
+    against (the content validator passes its own -- app.py's
+    CONTENT_VALIDATION_VERDICT_SCHEMA, {"status", "violations"}).
+
+    temperature, if given, overrides config.OLLAMA_TEMPERATURE for this call only.
 
     The long retry loop lives in report_queue, not here. Retrying indefinitely inside
     this call would hold the calling worker for as long as the host stayed down, and
@@ -296,7 +305,7 @@ def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=
         )
         try:
             raw, metrics, host = generate_raw(attempt_messages, model=model, hosts=hosts,
-                                               json_schema=json_schema)
+                                               json_schema=json_schema, temperature=temperature)
         except OllamaUnavailableError as exc:
             error_type = getattr(exc, "error_type", "unreachable")
             detail = str(exc)

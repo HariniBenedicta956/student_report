@@ -21,6 +21,145 @@ from core.scoring import compute_section_hints
 # than something to render loosely.
 TIERS = ("Strength", "Developing", "Focus Required", "Blind Spot")
 
+# The evidentiary bar for assigning each tier -- the SINGLE source both the
+# generation prompt (below, via _tier_criteria_block) and the content validator
+# (app.py's CONTENT_VALIDATION_RUBRIC, which imports this dict directly) are
+# built from. Before this, "does the tier match the evidence" existed only as a
+# vague instruction repeated in two places by hand, free to drift apart --
+# whichever one changed, the other silently didn't.
+#
+# Developing's criterion doubles as the thin/contradictory-evidence rule: it is
+# the default a dimension falls back to whenever the evidence doesn't clearly
+# clear the bar for Strength or Focus Required, rather than the model having to
+# invent a stronger read than the answers support.
+TIER_CRITERIA = {
+    "Strength": (
+        "Two or more of this dimension's answers consistently show the behaviour, "
+        "with no answer in the same dimension contradicting it. Never assign from a "
+        "single favourable answer alone."
+    ),
+    "Developing": (
+        "The default tier for this dimension. Use it whenever the evidence is "
+        "present but partial, inconsistent, drawn from a single answer only, or "
+        "thin/mixed/contradictory -- do not stretch thin or conflicting evidence "
+        "into Strength or Focus Required; say the evidence is limited instead."
+    ),
+    "Focus Required": (
+        "Two or more of this dimension's answers consistently show a clear gap or "
+        "difficulty, with no answer in the same dimension showing the opposite."
+    ),
+    "Blind Spot": (
+        "Only when two specific answers in this dimension directly conflict -- one "
+        "stating a belief or self-assessment, another showing behaviour that "
+        "contradicts it. Never assigned from a single answer."
+    ),
+}
+
+
+def _tier_criteria_block():
+    lines = ["TIER CRITERIA -- the evidentiary bar for assigning each tier to a "
+             "dimension. A tier that does not meet its own criterion below is a "
+             "validation failure:"]
+    for tier in TIERS:
+        lines.append(f"  * {tier}: {TIER_CRITERIA[tier]}")
+    return "\n".join(lines)
+
+
+# Strength/Focus Required/Blind Spot all require 2+ evidence_refs per
+# TIER_CRITERIA -- the one part of that rule that's mechanically checkable
+# (a count), rather than a judgement call. Observed live: stating this rule in
+# the prompt (even with a worked example) was not enough on its own -- the
+# model still elevated single-citation dimensions to Strength/Focus Required.
+# So this is a deterministic backstop, not just a hope: it runs on every
+# narrative result before anything downstream (validation, PDF) ever sees it,
+# which is what actually guarantees "never assert Strength or Blind Spot on
+# weak evidence" rather than relying on the model or a retry to get it right.
+MIN_EVIDENCE_FOR_STRONG_TIER = 2
+_THIN_EVIDENCE_NOTE = " (Evidence is limited -- based on a single response.)"
+
+
+def enforce_thin_evidence_rule(report_json):
+    """
+    Downgrades any dimension asserting Strength / Focus Required / Blind Spot
+    from fewer than MIN_EVIDENCE_FOR_STRONG_TIER evidence_refs to Developing,
+    appending a short note that the evidence is limited. Mutates and returns
+    report_json.
+
+    Only touches "dimensions" -- strong/focus/blindspot cards aren't tied to a
+    specific dimension by id in this schema, so a downgrade here doesn't
+    cascade to them; the content validator still checks those cards on their
+    own claims (see app.py's CONTENT_VALIDATION_RUBRIC).
+    """
+    for dim in report_json.get("dimensions") or []:
+        if not isinstance(dim, dict):
+            continue
+        tier = dim.get("tier")
+        refs = dim.get("evidence_refs")
+        thin = not isinstance(refs, list) or len(refs) < MIN_EVIDENCE_FOR_STRONG_TIER
+        if thin and tier in ("Strength", "Focus Required", "Blind Spot"):
+            dim["tier"] = "Developing"
+            description = dim.get("description") or ""
+            if _THIN_EVIDENCE_NOTE.strip() not in description:
+                dim["description"] = (description.rstrip() + _THIN_EVIDENCE_NOTE).strip()
+    return report_json
+
+
+# Worked examples of the gap between a claim that would fail validation and one
+# that would pass -- deliberately generic (illustrative question ids, not this
+# survey's real questions) so this stays correct if the question bank changes.
+# A rule ("every claim must be traceable") is abstract; a model follows a
+# contrast pair more reliably than a rule stated once in prose.
+_CLAIM_EXAMPLES = """
+EXAMPLES -- bad claim vs good claim:
+
+  1. BAD:  description: "Shows strong leadership and has led multiple teams."
+           evidence_refs: []
+           Wrong because: nothing was cited, and "led multiple teams" is asserted,
+           not something the answers say.
+     GOOD: description: "When faced with an unfamiliar problem (Q34), they said
+           they break it into smaller sub-tasks before starting -- a specific,
+           repeated approach, not just a stated preference."
+           evidence_refs: ["Q34"]
+           Right because: one exact answer is cited, and the description says only
+           what that answer shows, not more.
+
+  2. BAD:  name: "Growth Mindset", description: "Open to learning and improving."
+           Wrong because: generic enough to paste into any student's report
+           unchanged -- it isn't tied to anything this student specifically said.
+     GOOD: name: "Learning Under Deadline Pressure", description: "Answered that
+           they skip documentation entirely for tools they only need once (Q22),
+           while spending over 10 hours weekly on self-directed learning
+           otherwise (Q21) -- learning effort is real but selectively applied."
+           evidence_refs: ["Q21", "Q22"]
+           Right because: it names a pattern specific to two of this student's own
+           answers, not a trait that could belong to anyone.
+
+  3. BAD:  single_priority.body: "Keep working hard and stay motivated -- you
+           will succeed if you believe in yourself."
+           Wrong because: generic encouragement, true of any student, names no
+           concrete action.
+     GOOD: single_priority.body: "Their answers show they can break a problem
+           down (Q34) but consistently skip documenting the result (Q22) --
+           spend one focused session writing up their next solved problem
+           before moving to the next one."
+           Right because: names one specific action tied to a specific,
+           evidenced gap.
+
+  4. BAD:  name: "Documentation Habits", description: "Rarely documents work."
+           evidence_refs: ["Q28"], tier: "Focus Required"
+           Wrong because: only ONE answer is cited. TIER CRITERIA requires two
+           or more consistent answers for Focus Required (or Strength) -- one
+           answer, however clear, is thin evidence, not a pattern.
+     GOOD: name: "Documentation Habits", description: "Evidence on this is
+           limited -- one answer (Q28) suggests work often goes undocumented,
+           but there isn't a second answer to confirm it's a consistent
+           pattern rather than a one-off."
+           evidence_refs: ["Q28"], tier: "Developing"
+           Right because: with only one citation, the tier defaults to
+           Developing and says so explicitly, instead of asserting a stronger
+           pattern the evidence doesn't yet establish.
+""".strip()
+
 # The report shape the PDF template actually renders. This is deliberately a fixed
 # schema again: the template has named, laid-out regions (profile dimensions with
 # tier pills, strength cards, focus cards with a "Try this" action, blind-spot
@@ -43,7 +182,11 @@ fixed place for each one, so a missing or renamed field leaves a hole in the rep
       "name": "<short dimension name, 2-4 words, e.g. 'Learning Consistency'>",
       "description": "<ONE sentence, evidence-based, pointing at what their own
                        answers actually showed. Not advice -- an observation.>",
-      "tier": "<exactly one of: Strength | Developing | Focus Required | Blind Spot>"
+      "tier": "<exactly one of: Strength | Developing | Focus Required | Blind Spot>",
+      "evidence_refs": ["<the exact question id(s) from the QUESTION BANK this
+                          dimension's description and tier are based on, e.g.
+                          'Q8', 'Q19', 'U3' -- every id listed must be one this
+                          student actually has an answer for below, never invented>"]
     }
     // one per dimension you judge from the answers -- aim for 5-7, ordered
     // strongest first. Cover the range of the question bank rather than
@@ -85,6 +228,11 @@ Rules that matter:
     them and they read as precision the answers do not support.
   * Every claim must be traceable to this student's actual answers. Do not assert
     experience, projects, internships or achievements they did not report.
+  * "evidence_refs" must list only real question ids this student actually
+    answered (from the ids in the QUESTION BANK below) -- never an invented id,
+    never left empty. Write the description and tier FROM these answers, not
+    the other way around: pick the evidence first, then describe only what it
+    shows.
   * "action" fields must be doable in a week, not a career plan.
   * Never emit an empty string, an empty array, a placeholder, or a field left as
     the description above.
@@ -131,8 +279,9 @@ REPORT_JSON_SCHEMA = {
                     "name": {"type": "string"},
                     "description": {"type": "string"},
                     "tier": {"type": "string", "enum": list(TIERS)},
+                    "evidence_refs": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["name", "description", "tier"],
+                "required": ["name", "description", "tier", "evidence_refs"],
                 "additionalProperties": False,
             },
         },
@@ -170,9 +319,10 @@ every field above regardless, with the instruction applied to what goes in them.
 
 
 def _schema_description(instructions_text):
+    parts = [_SCHEMA_REPORT, "", _tier_criteria_block(), "", _CLAIM_EXAMPLES]
     if instructions_text:
-        return _SCHEMA_REPORT + "\n\n" + _SCHEMA_INSTRUCTION_NOTE
-    return _SCHEMA_REPORT
+        parts += ["", _SCHEMA_INSTRUCTION_NOTE]
+    return "\n".join(parts)
 
 TONE_RULES = (
     "Always write in encouraging, non-comparative language. Never describe the student "
@@ -181,43 +331,21 @@ TONE_RULES = (
 )
 
 
-def _build_system_message(mapping, instructions_text, question_bank_text=""):
+def _instruction_schema_and_output_tail(instructions_text):
     """
-    Order matters here, and not just for readability. The requester's instruction
-    is repeated at the very END of this message on purpose -- a model weights the
-    tail of its prompt most heavily, and burying the instruction mid-message is
-    the difference between it being followed and quietly ignored (observed twice
-    on this project). So the question bank, which is bulk reference material,
-    goes in the middle: after the data description that refers to it, but before
-    the instruction reminder that has to stay last.
+    Shared by _build_system_message (single-step, kept for the CLI study/older
+    callers) and build_narrative_messages (the live two-step path) -- one
+    source for the instruction-placement logic instead of two prompts that
+    could drift apart on exactly this point.
 
-    All of this is still byte-identical across students in a batch -- the
-    instruction is batch-level too -- so ordering it this way costs nothing in
-    prefix-cache reuse.
+    Order matters here, and not just for readability. The requester's
+    instruction is repeated at the very END on purpose -- a model weights the
+    tail of its prompt most heavily, and burying the instruction mid-message
+    is the difference between it being followed and quietly ignored (observed
+    twice on this project).
     """
     schema_description = _schema_description(instructions_text)
-
     parts = [
-        "You are writing a personalized career-readiness report for one student.",
-        "The next message (role: user) contains ONLY this one student's data, as a "
-        "compact JSON object with three keys. "
-        '"student" is their identity. '
-        '"section_hints" gives a preliminary 0-100 score per section computed directly '
-        "from their answers -- null means there is no pre-computed number and you must "
-        "judge that section entirely yourself. "
-        '"answers" is keyed by the question ids in the QUESTION BANK below: each value '
-        'has "a" (this student\'s answer) and, only for scenario questions with a known '
-        'right answer, "correct": true/false. Where "correct" is absent there is no '
-        "single right answer to judge against. If asked about wrong answers, mistakes, "
-        'or what to improve on specific questions, use "correct" as ground truth -- '
-        "don't re-judge correctness yourself. "
-        "Read every answer against its question in the QUESTION BANK; a question id "
-        "missing from \"answers\" means this student left it blank.",
-        TONE_RULES,
-    ]
-    if question_bank_text:
-        parts += ["", question_bank_text]
-    parts += [
         "",
         "Extra instructions from the report requester (this is the most important part "
         "of this message for CONTENT -- what to emphasise, which dimensions to pick, "
@@ -240,6 +368,43 @@ def _build_system_message(mapping, instructions_text, question_bank_text=""):
             f'this student\'s own answers.',
         ]
     parts += ["", "Output ONLY valid JSON. No markdown fences, no commentary."]
+    return parts
+
+
+def _build_system_message(mapping, instructions_text, question_bank_text=""):
+    """
+    Single-step system message: raw answers straight to a full report in one
+    call. Kept for the CLI study tool's --mode comparisons; the live app now
+    generates through build_evidence_extraction_messages +
+    build_narrative_messages instead (see those for why: this single call lets
+    the model assert anything, cited or not, while the two-step path
+    structurally cannot).
+
+    All of this is still byte-identical across students in a batch -- the
+    instruction is batch-level too -- so keeping shared material (the question
+    bank) ahead of the reminder costs nothing in prefix-cache reuse.
+    """
+    parts = [
+        "You are writing a personalized career-readiness report for one student.",
+        "The next message (role: user) contains ONLY this one student's data, as a "
+        "compact JSON object with three keys. "
+        '"student" is their identity. '
+        '"section_hints" gives a preliminary 0-100 score per section computed directly '
+        "from their answers -- null means there is no pre-computed number and you must "
+        "judge that section entirely yourself. "
+        '"answers" is keyed by the question ids in the QUESTION BANK below: each value '
+        'has "a" (this student\'s answer) and, only for scenario questions with a known '
+        'right answer, "correct": true/false. Where "correct" is absent there is no '
+        "single right answer to judge against. If asked about wrong answers, mistakes, "
+        'or what to improve on specific questions, use "correct" as ground truth -- '
+        "don't re-judge correctness yourself. "
+        "Read every answer against its question in the QUESTION BANK; a question id "
+        "missing from \"answers\" means this student left it blank.",
+        TONE_RULES,
+    ]
+    if question_bank_text:
+        parts += ["", question_bank_text]
+    parts += _instruction_schema_and_output_tail(instructions_text)
     return "\n".join(parts)
 
 
@@ -291,6 +456,23 @@ def build_question_bank(mapping, student_records):
             lines.append(f"{uid}. {question_text}")
 
     return {"text": "\n".join(lines), "unmapped_ids": unmapped_ids}
+
+
+def valid_answer_ids(student_record, question_bank=None):
+    """
+    The exact set of question ids this student has an answer for -- the same key
+    space _build_student_payload sends the model under "answers". Used to check
+    a generated dimension's evidence_refs actually cite something this student
+    was shown, rather than a fabricated or misattributed id (see REPORT_JSON_SCHEMA).
+
+    question_bank is needed for unmapped ids ("U1", "U2", ...) since those are
+    assigned batch-wide, in first-seen order across students, not derivable from
+    one student's record alone -- omitting it checks mapped answers only.
+    """
+    ids = {q["qid"] for questions in student_record["sections"].values() for q in questions}
+    if question_bank:
+        ids |= set(question_bank.get("unmapped_ids", {}).values())
+    return ids
 
 
 def _build_student_payload(student_record, mapping, question_bank):
@@ -360,6 +542,178 @@ def build_messages(student_record, mapping, instructions_text, question_bank=Non
         {"role": "system", "content": system_content},
         {"role": "user", "content": _build_student_payload(student_record, mapping, question_bank)},
     ]
+
+
+# --- two-step generation: extract evidence, then write from only that -------
+#
+# Report generation used to be the single call above: raw answers straight to
+# a full report, which lets the model assert anything whether or not an
+# answer actually backs it up -- catching that was entirely the content
+# validator's job, after the fact. Splitting into two calls makes it
+# structural instead: step 1 (below) does nothing but restate which answers
+# are relevant to which dimension, with no interpretation; step 2
+# (build_narrative_messages) never sees the raw answers at all, only step 1's
+# extraction, so it cannot cite or assert anything beyond what was already
+# pulled out.
+
+EVIDENCE_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dimensions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "qid": {"type": "string"},
+                                "note": {"type": "string"},
+                            },
+                            "required": ["qid", "note"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["name", "evidence"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["dimensions"],
+    "additionalProperties": False,
+}
+
+_EXTRACTION_SCHEMA_PROSE = """
+Output EXACTLY this JSON shape:
+
+{
+  "dimensions": [
+    {
+      "name": "<short dimension name, 2-4 words, e.g. 'Learning Consistency'>",
+      "evidence": [
+        {"qid": "<exact question id from the QUESTION BANK, e.g. 'Q8' or 'U3'>",
+         "note": "<a literal, neutral restatement of what THIS answer says --
+                   no adjectives, no judgment words like 'strong'/'good'/
+                   'consistent'/'weak', just what was said, e.g. 'rated 2 out
+                   of 5' or 'said they use AI to generate code and check the
+                   output'>"}
+        // every answer relevant to this dimension -- one entry per qid. Cite
+        // as many or as few as the answers actually support: do not pad, and
+        // do not omit an answer that is genuinely relevant.
+      ]
+    }
+    // propose 6-9 candidate dimensions covering the range of the question
+    // bank -- narrative writing (a separate step) picks the final 5-7 and
+    // may drop a dimension with too little evidence.
+  ]
+}
+
+Rules that matter:
+  * This is extraction only -- no interpretation, no tier, no opinion, no
+    quality judgment. "note" restates what the answer says, nothing more.
+  * "qid" must be a real id from the QUESTION BANK that this student actually
+    has an answer for below. Never invent one.
+  * If a dimension has only one relevant answer, cite only that one -- do not
+    invent a second just to reach a count.
+  * Skip a candidate dimension entirely if you cannot find real evidence for
+    it in this student's answers, rather than forcing one in.
+""".strip()
+
+
+def build_evidence_extraction_messages(student_record, mapping, question_bank=None):
+    """
+    Step 1 of 2 (see build_narrative_messages for step 2). Asks only for a
+    mechanical extraction -- which answers are relevant to which candidate
+    dimension, restated literally, with no interpretation or tier -- because
+    step 2 never sees the raw answers, only this.
+    """
+    if question_bank is None:
+        question_bank = build_question_bank(mapping, [student_record])
+    parts = [
+        "You are extracting evidence from one student's survey answers. This is "
+        "step 1 of 2 -- a separate step writes the report afterward using only "
+        "what you extract here, so anything you don't cite here cannot be used "
+        "in the report at all.",
+        "The next message (role: user) contains this one student's answers, keyed "
+        "by the question ids in the QUESTION BANK below. A question id missing "
+        "from it means this student left that question blank.",
+        "",
+        question_bank["text"],
+        "",
+        _EXTRACTION_SCHEMA_PROSE,
+        "",
+        "Output ONLY valid JSON. No markdown fences, no commentary.",
+    ]
+    system_content = "\n".join(parts)
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": _build_student_payload(student_record, mapping, question_bank)},
+    ]
+
+
+def build_narrative_messages(evidence, student_record, instructions_text, retry_feedback=None):
+    """
+    Step 2 of 2 (see build_evidence_extraction_messages for step 1). The user
+    message below carries ONLY the extraction -- never this student's raw
+    answers -- so nothing beyond what step 1 already cited is available to
+    draw from here; a claim step 1 didn't extract structurally cannot appear.
+
+    Reuses _instruction_schema_and_output_tail so the instruction-placement
+    logic (and the schema/tier-criteria/examples block) is the exact same text
+    _build_system_message uses, not a separately maintained copy of it.
+
+    retry_feedback, when given ({"previous_output": str, "reasons": [...]}),
+    appends the previous attempt and exactly why it failed -- full
+    regeneration, same reasoning as _study_retry_messages: asking the model to
+    patch one field invites an edit that no longer agrees with the rest of the
+    report, so it's asked to produce the whole thing again, corrected, from
+    the same EVIDENCE (extraction is regenerated separately, fresh, by the
+    caller -- this is step 2's half of that "never a patch" regeneration).
+    """
+    identity = student_record["identity"]
+    parts = [
+        "You are writing a personalized career-readiness report for one student, "
+        "using ONLY the EVIDENCE given in the next message -- already extracted "
+        "from their answers by a separate step, organized per candidate "
+        "dimension. Do not use any claim, fact, or detail that is not in one of "
+        "these evidence notes; if EVIDENCE doesn't support something, don't say "
+        "it. You may drop a candidate dimension if its evidence is too thin to "
+        "write about honestly, but never add a dimension EVIDENCE doesn't cover.",
+        TONE_RULES,
+    ]
+    parts += _instruction_schema_and_output_tail(instructions_text)
+    system_content = "\n".join(parts)
+
+    user_payload = {
+        "student": {
+            "name": identity.get("name", ""),
+            "branch": identity.get("branch", ""),
+            "year": identity.get("year", ""),
+            "institution": identity.get("institution", ""),
+        },
+        "EVIDENCE": evidence.get("dimensions", []),
+    }
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False,
+                                                separators=(",", ":"))},
+    ]
+    if retry_feedback:
+        reasons = retry_feedback.get("reasons") or []
+        reason_text = "; ".join(reasons) if reasons else "unspecified validation failure"
+        messages += [
+            {"role": "assistant", "content": retry_feedback.get("previous_output") or "(no output produced)"},
+            {"role": "user", "content":
+                f"That output failed validation for this reason: {reason_text}\n\n"
+                "Regenerate the COMPLETE report from scratch using ONLY the same "
+                "EVIDENCE given above. Do not patch or edit the previous output -- "
+                "produce the whole report again, corrected. Output ONLY valid JSON."},
+        ]
+    return messages
 
 
 _QA_LISTING_KEYWORDS = (
