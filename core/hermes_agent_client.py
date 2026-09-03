@@ -58,7 +58,7 @@ def generate_report_two_step(student_record, mapping, instructions_text, questio
         question_bank = prompt_builder.build_question_bank(mapping, [student_record])
 
     extraction_messages = prompt_builder.build_evidence_extraction_messages(
-        student_record, mapping, question_bank)
+        student_record, mapping, instructions_text, question_bank)
     extraction_result = ollama_client.generate_json(
         extraction_messages, model=model, on_retry=on_retry, hosts=hosts,
         json_schema=prompt_builder.EVIDENCE_EXTRACTION_SCHEMA,
@@ -137,6 +137,13 @@ def generate_report_two_step(student_record, mapping, instructions_text, questio
 def gpu_status():
     """Report the live status of the active Qwen/Ollama host without any HTTP gateway."""
     return ollama_client.study_gpu_status()
+
+
+def warm_model():
+    """Loads the active model into memory so the badge doesn't sit on "no model
+    resident" until whoever's turn it is happens to run a real generation."""
+    return ollama_client.warm_model(model=config.get_active_ollama_model(),
+                                     hosts=config.get_active_hosts())
 
 
 def probe_capacity(hosts=None):

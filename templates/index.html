@@ -3,8 +3,15 @@
 
 <div class="page">
   <h1>Career Readiness Report Generator</h1>
-  <p class="subtitle">Upload a survey CSV, add an instruction, generate a personalized PDF report per student.
-    <a href="/validate">Validate a generated batch →</a></p>
+  <p class="subtitle">Upload a survey CSV, add an instruction, generate a personalized PDF report per student.</p>
+
+  <div class="flow-nav">
+    <span class="flow-step active">1. Generate</span>
+    <span class="flow-arrow">→</span>
+    <a class="flow-step" href="/validate">2. Validate</a>
+    <span class="flow-arrow">→</span>
+    <span class="flow-step disabled" title="Validate a batch first">3. Revalidate</span>
+  </div>
 
   <div class="gpu-badge" id="gpu-badge" title="Checked against the Ollama host before each run">
     Running on: <b id="gpu-badge-text">checking…</b>

@@ -196,13 +196,45 @@ async function refreshGpuBadge() {
     } else if (s.on_gpu === false) {
       gpuBadgeText.textContent = `${s.processor} ⚠️`;
       gpuBadge.classList.add("on-cpu");
+    } else if (s.reachable) {
+      // No model resident yet -- rather than sit on "unknown" until whoever's
+      // turn it is happens to click Generate, trigger a warm-up load now and
+      // re-check once it's done, so the badge settles on a real answer.
+      gpuBadgeText.textContent = "warming up…";
+      warmModelAndRecheck();
     } else {
-      gpuBadgeText.textContent = s.reachable ? "unknown — no model loaded yet" : "host unreachable ⚠️";
+      gpuBadgeText.textContent = "host unreachable ⚠️";
+      gpuBadge.classList.add("on-cpu");
+    }
+    gpuBadge.title = s.detail || "";
+  } catch (err) {
+    gpuBadgeText.textContent = "unavailable";
+  }
+}
+
+let warming = false;
+async function warmModelAndRecheck() {
+  if (warming) return;  // a badge refresh already in flight -- don't stack calls
+  warming = true;
+  try {
+    const res = await fetch("/warm-model", { method: "POST" });
+    const s = await res.json();
+    gpuBadge.classList.remove("on-gpu", "on-cpu");
+    if (s.on_gpu === true) {
+      gpuBadgeText.textContent = `${s.processor} ✅`;
+      gpuBadge.classList.add("on-gpu");
+    } else if (s.on_gpu === false) {
+      gpuBadgeText.textContent = `${s.processor} ⚠️`;
+      gpuBadge.classList.add("on-cpu");
+    } else {
+      gpuBadgeText.textContent = s.reachable ? "unknown — warm-up didn't load a model" : "host unreachable ⚠️";
       if (!s.reachable) gpuBadge.classList.add("on-cpu");
     }
     gpuBadge.title = s.detail || "";
   } catch (err) {
     gpuBadgeText.textContent = "unavailable";
+  } finally {
+    warming = false;
   }
 }
 

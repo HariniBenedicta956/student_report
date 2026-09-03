@@ -341,7 +341,7 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
             # shown here; they're attached to the "ai_processing" step instead,
             # once step 1 has actually run.
             messages = prompt_builder.build_evidence_extraction_messages(
-                student_record, mapping, question_bank
+                student_record, mapping, instructions_text, question_bank=question_bank
             )
             prompt_code = execution_trace.get_code(prompt_builder, "build_evidence_extraction_messages")
     execution_trace.set_step(
@@ -787,6 +787,20 @@ STUDY_MIN_HEADLINE_CHARS = 8
 @app.get("/gpu-status")
 def gpu_status():
     """Backs the "Running on:" badge on Screen 1, checked before each run."""
+    return jsonify(hermes_agent_client.gpu_status())
+
+
+@app.post("/warm-model")
+def warm_model():
+    """
+    Triggers a trivial call to load the model into memory, then re-reports
+    status -- called by the badge itself the moment it sees no model
+    resident, so a page load doesn't just sit on "unknown" until someone
+    happens to run a real generation. Runs synchronously (a cold load is
+    usually a few seconds); the route timing out is itself informative to
+    the caller rather than something to hide behind a background thread.
+    """
+    hermes_agent_client.warm_model()
     return jsonify(hermes_agent_client.gpu_status())
 
 

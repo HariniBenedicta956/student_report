@@ -4,6 +4,7 @@ const countEl = document.getElementById("validate-count");
 const detailPanel = document.getElementById("detail-panel");
 const detailTitle = document.getElementById("detail-title");
 const detailMeta = document.getElementById("detail-meta");
+const detailFailureSummary = document.getElementById("detail-failure-summary");
 const detailAttempts = document.getElementById("detail-attempts");
 const breakerBanner = document.getElementById("circuit-breaker-banner");
 const breakerText = document.getElementById("circuit-breaker-text");
@@ -74,18 +75,13 @@ function render(validation) {
     const cls = statusClass(entry);
     const showDots = entry.status === "pending" || entry.status === "running";
     const hasPdf = entry.status === "done" && entry.passed;
-    // The failed-reports list gets one short recurring-issue line here, not
-    // the full per-attempt violation history -- that stays behind "Details".
-    const failedSummary = entry.status === "done" && !entry.passed && entry.recurring_issue_summary
-      ? `<div class="meta" style="margin-top:2px;max-width:480px;white-space:normal">${escapeHtml(entry.recurring_issue_summary)}</div>`
-      : "";
     // Details are available the moment a student starts validating, not only
     // once it settles -- the backend already writes each attempt to disk as
     // it happens (storage.save_batch_validation), so there's real data to
     // show mid-run. Only "pending" (not started yet) has nothing to show.
     const canShowDetail = settled || entry.status === "running";
     tr.innerHTML = `
-      <td class="name">${escapeHtml(entry.name || entry.student_id)}${failedSummary}</td>
+      <td class="name">${escapeHtml(entry.name || entry.student_id)}</td>
       <td class="status-cell"><span class="status ${cls}">${statusLabel(entry)}${showDots ? dots() : ""}</span></td>
       <td class="action-cell">
         <button class="link-btn detail-btn" data-student-id="${entry.student_id}" ${canShowDetail ? "" : "disabled"}>Details</button>
@@ -243,6 +239,16 @@ function renderDetail(entry, scroll) {
     metaBits.push(`<span>Content check not available — source answers weren't saved for this batch</span>`);
   }
   detailMeta.innerHTML = metaBits.join("");
+
+  // The short "why did this fail" line -- shown prominently at the top of
+  // the details panel, not buried in the row list, and not the full
+  // per-attempt violation history repeated (that's the attempt blocks below).
+  if (entry.status === "done" && !entry.passed && entry.recurring_issue_summary) {
+    detailFailureSummary.innerHTML = `<strong>Why this failed:</strong> ${escapeHtml(entry.recurring_issue_summary)}`;
+    detailFailureSummary.style.display = "block";
+  } else {
+    detailFailureSummary.style.display = "none";
+  }
 
   detailAttempts.innerHTML = "";
   if (entry.status === "running" && attempts.length === 0) {

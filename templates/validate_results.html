@@ -5,11 +5,20 @@
   <h1>Validation results</h1>
   <p class="subtitle">Batch {{ batch_id }} — <a href="/batch/{{ batch_id }}">view reports</a></p>
 
+  <div class="flow-nav">
+    <a class="flow-step" href="/batch/{{ batch_id }}">1. Generate</a>
+    <span class="flow-arrow">→</span>
+    <span class="flow-step active">2. Validate</span>
+    <span class="flow-arrow">→</span>
+    <a class="flow-step" href="#revalidation-panel">3. Revalidate</a>
+  </div>
+
   <div class="card" id="summary-panel" style="display:none">
     <p class="section-label">Summary</p>
     <p id="summary-line" class="summary-line"></p>
   </div>
 
+  <!-- Part 2: Validation -- what was checked, and the per-student result. -->
   <div class="card criteria-panel">
     <p class="section-label">What each check verifies</p>
     <p class="criteria-line"><strong>Structural check</strong> — pure Python, no model call: every
@@ -27,28 +36,12 @@
     <p class="criteria-line criteria-exclusion">{{ content_exclusion }}</p>
     <p class="criteria-line">Skipped if the structural check already failed, or if this batch predates
       per-student source-answer storage.</p>
-    <p class="criteria-line">A failure on either check triggers a full regeneration (never a patch) from
-      the same source answers plus the specific error, up to <strong>{{ retry_cap }} attempts</strong>
-      total. A retry that ultimately passes replaces the batch's stored JSON and PDF.</p>
-  </div>
-
-  <div class="card" id="circuit-breaker-banner" style="display:none">
-    <p class="criteria-line" id="circuit-breaker-text"></p>
-    <button class="link-btn" id="resume-skipped-btn">Resume skipped students</button>
-  </div>
-
-  <div class="card" id="failure-summary-panel" style="display:none">
-    <p class="section-label">Why this batch is failing — grouped by cause</p>
-    <table>
-      <tbody id="failure-summary-rows"></tbody>
-    </table>
   </div>
 
   <div class="card">
     <div class="top-actions">
       <span class="count" id="validate-count">checking…</span>
       <div class="buttons">
-        <button class="link-btn" id="retry-failed-btn" style="display:none">Re-validate failed only</button>
         <a class="link-btn" id="download-zip-btn" href="/batch/{{ batch_id }}/zip" style="display:none">Download all as zip</a>
       </div>
     </div>
@@ -60,7 +53,33 @@
   <div class="card explore-panel" id="detail-panel">
     <p class="section-label" id="detail-title">details</p>
     <div class="detail-meta" id="detail-meta"></div>
+    <div class="error-banner" id="detail-failure-summary" style="display:none"></div>
     <div id="detail-attempts"></div>
+  </div>
+
+  <!-- Part 3: Revalidation -- everything that re-triggers a check lives here,
+       in one place, instead of a retry button scattered wherever a failure
+       happened to be shown. -->
+  <div class="card" id="revalidation-panel">
+    <p class="section-label">Revalidation</p>
+    <p class="criteria-line">A failure on either check triggers a full regeneration (never a patch) from
+      the same source answers plus the specific error, up to <strong>{{ retry_cap }} attempts</strong>
+      total, automatically, before a student is left marked failed. Use this section to re-run that
+      manually — after a prompt/rubric fix, for example.</p>
+
+    <div id="circuit-breaker-banner" style="display:none">
+      <p class="criteria-line" id="circuit-breaker-text"></p>
+      <button class="link-btn" id="resume-skipped-btn">Resume skipped students</button>
+    </div>
+
+    <button class="btn-secondary" id="retry-failed-btn" style="display:none">Re-validate all failed students</button>
+
+    <div id="failure-summary-panel" style="display:none">
+      <p class="section-label" style="margin-top:18px">Why this batch is failing — grouped by cause, retry one group at a time</p>
+      <table>
+        <tbody id="failure-summary-rows"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 

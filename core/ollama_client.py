@@ -415,6 +415,33 @@ def study_gpu_status(hosts=None, timeout=(3, 5)):
             "detail": "no hosts configured"}
 
 
+def warm_model(model=None, hosts=None, timeout=(5, 60)):
+    """
+    Loads the model into memory with a trivial call, so the "Running on:"
+    badge doesn't have to sit on "no model resident" until whoever's turn it
+    is happens to run a real generation -- the badge can trigger this itself
+    the moment it sees an empty /api/ps, the same way docs/GPU_SETUP.md's own
+    warm-up curl does, just from the app instead of a terminal.
+
+    Best-effort: swallows failures rather than raising, since the caller only
+    wants "did the model end up resident", answered by re-checking
+    study_gpu_status afterward, not by this call succeeding on its own terms.
+    """
+    target_model = model or config.get_active_ollama_model()
+    for host in (hosts or config.get_active_hosts()):
+        try:
+            requests.post(
+                f"{host}/api/generate",
+                json={"model": target_model, "prompt": "hi", "stream": False,
+                      "keep_alive": config.OLLAMA_KEEP_ALIVE},
+                timeout=timeout,
+            ).raise_for_status()
+            return True
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError, ValueError):
+            continue
+    return False
+
+
 def nvidia_smi_utilization():
     """
     The optional cross-check from validation.md: GPU utilisation straight from

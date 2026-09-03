@@ -34,6 +34,47 @@ h1 {
   margin: 0 0 24px;
 }
 
+/* The 3-part flow every batch goes through: Generate -> Validate ->
+   Revalidate. Shown on every page in that flow so it's always clear which
+   part you're in and how to reach the others, instead of the only way
+   between them being a single easy-to-miss link. */
+.flow-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 20px;
+  font-size: 12px;
+}
+
+.flow-step {
+  color: var(--text-secondary);
+  text-decoration: none;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 0.5px solid var(--border);
+  background: var(--bg-card);
+}
+
+a.flow-step:hover { border-color: var(--text-secondary); }
+
+.flow-step.active {
+  color: var(--text-primary);
+  font-weight: 600;
+  border-color: var(--text-primary);
+  background: var(--bg-card);
+}
+
+.flow-step.disabled {
+  color: var(--text-secondary);
+  opacity: 0.5;
+  cursor: default;
+}
+
+.flow-arrow {
+  color: var(--border);
+  font-size: 12px;
+}
+
 .section-label {
   color: var(--text-secondary);
   font-size: 12px;

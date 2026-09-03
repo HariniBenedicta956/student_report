@@ -624,12 +624,21 @@ Rules that matter:
 """.strip()
 
 
-def build_evidence_extraction_messages(student_record, mapping, question_bank=None):
+def build_evidence_extraction_messages(student_record, mapping, instructions_text="", question_bank=None):
     """
     Step 1 of 2 (see build_narrative_messages for step 2). Asks only for a
     mechanical extraction -- which answers are relevant to which candidate
     dimension, restated literally, with no interpretation or tier -- because
     step 2 never sees the raw answers, only this.
+
+    instructions_text is passed here too, not only to step 2. Extraction is
+    what decides which answers exist to work with at all -- a request to
+    steer the report toward a specific focus has to reach THIS step, or step
+    2 has nothing relevant to draw on no matter how well it follows the
+    instruction itself. (Missed in the original two-step split: instructions
+    reached the narrative step but not extraction, so a focused request could
+    silently have no effect if the default range of extracted evidence didn't
+    happen to cover it.)
     """
     if question_bank is None:
         question_bank = build_question_bank(mapping, [student_record])
@@ -641,6 +650,18 @@ def build_evidence_extraction_messages(student_record, mapping, question_bank=No
         "The next message (role: user) contains this one student's answers, keyed "
         "by the question ids in the QUESTION BANK below. A question id missing "
         "from it means this student left that question blank.",
+    ]
+    if instructions_text:
+        parts += [
+            "",
+            f'The report requester asked for this: "{instructions_text}". Make sure '
+            "the candidate dimensions you propose and the evidence you cite actually "
+            "cover what this asks for -- don't just extract the generic default "
+            "range if the request points at something more specific than that. "
+            "(You are only extracting evidence here, not writing the report itself "
+            "-- a later step does that from what you cite.)",
+        ]
+    parts += [
         "",
         question_bank["text"],
         "",
