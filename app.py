@@ -12,8 +12,10 @@ from werkzeug.utils import secure_filename
 
 import config
 from core import csv_ingest
+from core import db
 from core import execution_trace
 from core import hermes_agent_client
+from core import mapping_inference
 from core import ollama_client
 from core import pdf_generator
 from core import perf_logging
@@ -29,6 +31,7 @@ app = Flask(__name__)
 os.makedirs(config.UPLOAD_DIR, exist_ok=True)
 os.makedirs(config.QUESTION_BANK_DIR, exist_ok=True)
 os.makedirs(config.BATCHES_DIR, exist_ok=True)
+db.init_db()
 
 
 @app.get("/health")
@@ -41,20 +44,67 @@ def index():
     return render_template("index.html")
 
 
+_UPLOAD_MAPPING_DIR = os.path.join(config.UPLOAD_DIR, "mappings")
+
+
+def _mapping_path(upload_id):
+    # A dedicated subdirectory, not a "<upload_id>_..." file directly in
+    # UPLOAD_DIR -- _find_uploaded_file below prefix-scans UPLOAD_DIR for
+    # "<upload_id>_*" to find the saved CSV, and a mapping file matching that
+    # same pattern would race it non-deterministically (os.listdir order
+    # isn't guaranteed), occasionally "finding" the mapping json as if it
+    # were the CSV.
+    os.makedirs(_UPLOAD_MAPPING_DIR, exist_ok=True)
+    return os.path.join(_UPLOAD_MAPPING_DIR, f"{upload_id}.json")
+
+
 @app.post("/upload")
 def upload():
+    """
+    Mapping is generated fresh for THIS run whenever a question bank's text is
+    given (core/mapping_inference.py -- no reference to any pre-authored
+    config, so a differently-structured form maps differently with no code
+    change). Falls back to the static section_mapping.json when no question
+    bank text is available this run, or when auto-mapping itself fails (e.g.
+    the question bank has no numbered questions it could find) -- either way
+    the upload still succeeds rather than being blocked.
+
+    Whichever mapping is used gets saved alongside this upload_id, so
+    /generate parses the same CSV against the exact same mapping shown here,
+    not a possibly-different one recomputed later.
+    """
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     file = request.files["file"]
     if not file.filename:
         return jsonify({"error": "No file selected"}), 400
 
-    try:
-        mapping = csv_ingest.load_section_mapping()
-    except csv_ingest.SectionMappingMissingError as exc:
-        return jsonify({"error": str(exc)}), 500
-
     file_bytes = file.read()
+    question_bank_text = (request.form.get("question_bank_text") or "").strip()
+
+    mapping_source = "static"
+    review_columns = []
+    mapping = None
+    auto_map_error = None
+    if question_bank_text:
+        try:
+            mapping, review_columns = mapping_inference.infer_mapping(file_bytes, question_bank_text)
+            mapping_source = "auto"
+        except mapping_inference.MappingInferenceError as exc:
+            auto_map_error = str(exc)
+        except Exception as exc:  # noqa: BLE001 -- any other extraction hiccup also just falls back
+            log.exception("Auto-mapping failed, falling back to static mapping")
+            auto_map_error = str(exc)
+
+    if mapping is None:
+        try:
+            mapping = csv_ingest.load_section_mapping()
+        except csv_ingest.SectionMappingMissingError as exc:
+            if auto_map_error:
+                return jsonify({"error": f"Auto-mapping failed ({auto_map_error}), and no "
+                                          f"static section_mapping.json to fall back to: {exc}"}), 500
+            return jsonify({"error": str(exc)}), 500
+
     try:
         students = csv_ingest.parse_csv(file_bytes, mapping)
     except Exception as exc:
@@ -69,12 +119,17 @@ def upload():
     saved_path = os.path.join(config.UPLOAD_DIR, f"{upload_id}_{safe_name}")
     with open(saved_path, "wb") as f:
         f.write(file_bytes)
+    with open(_mapping_path(upload_id), "w", encoding="utf-8") as f:
+        json.dump(mapping, f, indent=2)
 
     return jsonify({
         "upload_id": upload_id,
         "filename": file.filename,
         "student_count": len(students),
         "saved_path": saved_path,
+        "mapping_source": mapping_source,
+        "auto_map_error": auto_map_error,
+        "review_columns": review_columns,
         "students": [
             {
                 "index": i,
@@ -90,8 +145,121 @@ def upload():
                 # gets checked instead of a stub.
                 "completion_pct": s.get("completion_pct", 0.0),
                 "overall_score": scoring.compute_overall_score(s["sections"]),
+                "unanswered_questions": s.get("unanswered_questions", []),
             }
             for i, s in enumerate(students)
+        ],
+    })
+
+
+_TEXT_QBANK_EXTENSIONS = (".md", ".txt", ".csv")
+
+
+def _extract_question_bank_text(file_bytes, filename):
+    """
+    Best-effort plain-text extraction for auto-mapping (core/mapping_inference.py
+    only needs the question numbers/text/Type: lines as text, not formatting).
+    .md/.txt/.csv are read directly. .pdf is attempted via pypdf if it happens
+    to be installed; .docx isn't attempted at all yet. Either way, failing to
+    extract text never blocks the upload -- it just means this run falls back
+    to the static section_mapping.json (see /upload), same as leaving the
+    question bank box empty.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in _TEXT_QBANK_EXTENSIONS:
+        try:
+            return file_bytes.decode("utf-8-sig"), None
+        except UnicodeDecodeError:
+            return None, "could not decode as text (unexpected encoding)"
+    if ext == ".pdf":
+        try:
+            import pypdf
+        except ImportError:
+            return None, "PDF text extraction isn't available in this install -- upload a .md/.txt/.csv question bank for auto-mapping"
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            return (text, None) if text.strip() else (None, "no extractable text found in this PDF")
+        except Exception as exc:  # noqa: BLE001 -- extraction failure just means "no auto-mapping"
+            return None, f"could not read this PDF: {exc}"
+    return None, f"{ext or 'this file type'} isn't supported for auto-mapping yet -- upload a .md/.txt/.csv question bank"
+
+
+@app.post("/sync-eligibility")
+def sync_eligibility():
+    """
+    Step 2 of the workflow: admin sets a completion % threshold (never fixed
+    at 100%), this recomputes completion % per student from the SAME mapping
+    /upload used (so an auto-mapped, differently-structured CSV is checked
+    correctly, not against a mismatched default), and stores eligible Yes/No
+    per student in the database -- not just a client-side filter, an actual
+    persisted record (core/db.py's `eligibility` table). Re-running this
+    (a different threshold, or the same one again) overwrites that upload's
+    prior rows rather than accumulating duplicates.
+
+    Only question-answer columns count toward completion % -- identity
+    columns are excluded by construction, since mapped_cols (what
+    completion_pct is computed from in csv_ingest.parse_csv) never includes
+    them. Blank, hyphen, and empty cells all count as unanswered (see
+    csv_ingest.NOT_ANSWERED_PLACEHOLDERS).
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    upload_id = payload.get("upload_id")
+    if not upload_id:
+        return jsonify({"error": "upload_id is required"}), 400
+    try:
+        threshold_pct = float(payload.get("threshold_pct"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "threshold_pct (a number) is required"}), 400
+    min_score = payload.get("min_score")
+    min_score = float(min_score) if min_score not in (None, "") else None
+
+    saved_path = _find_uploaded_file(upload_id)
+    if not saved_path:
+        return jsonify({"error": "Uploaded file not found, please re-upload"}), 404
+    try:
+        with open(_mapping_path(upload_id), "r", encoding="utf-8") as f:
+            mapping = json.load(f)
+    except FileNotFoundError:
+        mapping = csv_ingest.load_section_mapping()
+
+    with open(saved_path, "rb") as f:
+        students = csv_ingest.parse_csv(f.read(), mapping)
+
+    rows = []
+    for i, s in enumerate(students):
+        completion_pct = s.get("completion_pct", 0.0)
+        overall_score = scoring.compute_overall_score(s["sections"])
+        meets_completion = completion_pct >= threshold_pct
+        meets_score = min_score is None or (overall_score is not None and overall_score >= min_score)
+        eligible = meets_completion and meets_score
+        rows.append({
+            "index": i,
+            "student_id": s["identity"].get("roll_number") or s["identity"].get("name") or f"student-{i}",
+            "name": s["identity"].get("name", ""),
+            "completion_pct": completion_pct,
+            "overall_score": overall_score,
+            "threshold_pct": threshold_pct,
+            "min_score": min_score,
+            "eligible": eligible,
+            "unanswered_json": json.dumps(s.get("unanswered_questions", [])),
+        })
+
+    db.record_eligibility(upload_id, rows)
+
+    return jsonify({
+        "upload_id": upload_id,
+        "threshold_pct": threshold_pct,
+        "min_score": min_score,
+        "eligible_count": sum(1 for r in rows if r["eligible"]),
+        "total": len(rows),
+        "students": [
+            {
+                "index": r["index"], "name": r["name"], "eligible": r["eligible"],
+                "completion_pct": r["completion_pct"], "overall_score": r["overall_score"],
+                "unanswered_questions": json.loads(r["unanswered_json"]),
+            }
+            for r in rows
         ],
     })
 
@@ -99,12 +267,13 @@ def upload():
 @app.post("/upload-question-bank")
 def upload_question_bank():
     """
-    Saves the uploaded question bank file (e.g. a UIT.md-style document) to disk --
-    it is NOT parsed or auto-applied to section_mapping.json. Building that mapping
-    involves judgment calls (which section a question belongs to, correct answers for
-    scenario questions, low->high ordering) that need review rather than a blind
-    automated parse, so this just gets the file to a place it can be read and the
-    mapping updated deliberately afterward.
+    Saves the uploaded question bank file (e.g. a UIT.md-style document) to disk,
+    and -- for a text-readable format -- also extracts its text so /upload can use
+    it to auto-generate this run's mapping (core/mapping_inference.py). Extraction
+    failing (an unsupported format, an unreadable PDF) never blocks the save; it
+    just means this run has no question bank text to auto-map from, same as if
+    none had been uploaded, and the app falls back to the static
+    section_mapping.json.
     """
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
@@ -112,11 +281,20 @@ def upload_question_bank():
     if not file.filename:
         return jsonify({"error": "No file selected"}), 400
 
+    file_bytes = file.read()
     safe_name = secure_filename(file.filename)
     saved_path = os.path.join(config.QUESTION_BANK_DIR, f"{uuid.uuid4().hex}_{safe_name}")
-    file.save(saved_path)
+    with open(saved_path, "wb") as f:
+        f.write(file_bytes)
 
-    return jsonify({"filename": file.filename, "saved_path": saved_path})
+    text, extraction_note = _extract_question_bank_text(file_bytes, file.filename)
+
+    return jsonify({
+        "filename": file.filename,
+        "saved_path": saved_path,
+        "text": text,
+        "extraction_note": extraction_note,
+    })
 
 
 def _find_uploaded_file(upload_id):
@@ -181,7 +359,16 @@ def generate():
         return jsonify({"error": "Uploaded file not found, please re-upload"}), 404
     original_filename = os.path.basename(saved_path).split("_", 1)[-1]
 
-    mapping = csv_ingest.load_section_mapping()
+    # The exact mapping /upload used for this upload_id (auto-generated or
+    # static, whichever it was) -- not a fresh call to load_section_mapping(),
+    # which would silently ignore an auto-generated mapping and re-parse
+    # against the wrong one, disagreeing with the completion%/checklist the
+    # admin already saw and acted on.
+    try:
+        with open(_mapping_path(upload_id), "r", encoding="utf-8") as f:
+            mapping = json.load(f)
+    except FileNotFoundError:
+        mapping = csv_ingest.load_section_mapping()
     t0 = time.perf_counter()
     with open(saved_path, "rb") as f:
         csv_bytes = f.read()
@@ -196,6 +383,12 @@ def generate():
         return jsonify({"error": "No students selected"}), 400
 
     batch_id, manifest = storage.create_batch(students)
+    # The exact mapping used to parse this CSV, saved with the batch itself --
+    # /batch/<id>/validate reads this back rather than always reaching for the
+    # static section_mapping.json, so an auto-mapped batch (a differently-
+    # structured form) is validated against the mapping that actually matches
+    # it, not a mismatched default.
+    storage.save_batch_mapping(batch_id, mapping)
     # Saved once here rather than left to only live in this request's memory --
     # it's what lets /batch/<id>/validate check a report's content against the
     # student's actual answers later, without needing the original CSV to still
@@ -359,7 +552,10 @@ def _generate_one(batch_id, student_id, student_index, student_record, mapping,
     raw_text = None
     host_used = None
     storage.update_student_progress(batch_id, student_id, "ai_call")
-    selected_model = config.get_active_ollama_model()
+    # Locked, explicit -- see config.GENERATION_MODEL (currently 4b: 9b was
+    # confirmed running on CPU on this deployment's GPU host -- see that
+    # constant's comment for the live numbers and how to switch back).
+    selected_model = config.GENERATION_MODEL
     hermes_request_info = {
         "hosts_tried_in_order": list(ctx.hosts) if ctx else config.get_active_hosts(),
         "model": selected_model,
@@ -599,7 +795,30 @@ def batch_students(batch_id):
         manifest = storage.load_manifest(batch_id)
     except FileNotFoundError:
         abort(404)
-    return jsonify(storage.with_live_progress(manifest))
+    manifest = storage.with_live_progress(manifest)
+
+    # Real per-student processing time and a running success/failure count for
+    # this batch -- total_s comes from each student's own saved _perf (see
+    # _generate_one, which measures its own wall-clock time; not estimated,
+    # not assumed), and done_count/error_count are counted fresh from the
+    # manifest's actual statuses every call rather than tracked separately
+    # and risking drifting out of sync.
+    done_count = error_count = 0
+    for s in manifest["students"]:
+        if s.get("status") == "done":
+            done_count += 1
+            try:
+                report = storage.load_student_report(batch_id, s["student_id"])
+            except FileNotFoundError:
+                continue
+            perf = report.get("_perf") or {}
+            s["total_s"] = (perf.get("stages_s") or {}).get("total_s")
+            s["attempts"] = perf.get("attempts")
+        elif s.get("status") == "error":
+            error_count += 1
+    manifest["done_count"] = done_count
+    manifest["error_count"] = error_count
+    return jsonify(manifest)
 
 
 @app.get("/batch/<batch_id>/students/<student_id>")
@@ -693,12 +912,15 @@ from datetime import datetime, timezone   # noqa: E402
 # Which call path generation uses. --mode agent|direct overrides this at the CLI.
 USE_AGENT = True
 
-# Only qwen3.5:4b runs actively for this study, in both roles -- generation and
-# validation. The Hermes call the app would otherwise make is commented out
+# CLI --mode study tooling ONLY -- the live web app no longer reads these two
+# (see config.GENERATION_MODEL / config.CONTENT_VALIDATION_MODEL, the locked
+# production split). Kept here, still overridable via STUDY_MODEL, so
+# benchmarking a candidate model change stays a CLI flag instead of needing
+# a code edit. The Hermes call the app would otherwise make is commented out
 # rather than deleted, so restoring it is a one-line change.
 # STUDY_GENERATION_MODEL = config.OLLAMA_HERMES3_MODEL   # Hermes -- disabled for this study
 STUDY_GENERATION_MODEL = os.environ.get("STUDY_MODEL", "qwen3.5:4b")
-STUDY_VALIDATION_MODEL = STUDY_GENERATION_MODEL   # same model, two roles
+STUDY_VALIDATION_MODEL = STUDY_GENERATION_MODEL   # same model, two roles -- CLI study default only
 
 # The two call paths being compared. Same model, same prompt, same validation --
 # the ONLY difference is how the generation request reaches Ollama.
@@ -1085,35 +1307,45 @@ def _violation(category, dimension, detail):
     return {"category": category, "dimension": dimension or "", "detail": detail}
 
 
-def validate_with_model(report_json, student_record, mapping, question_bank, hosts=None):
+def validate_with_model(report_json, student_record, mapping, question_bank, hosts=None, model=None):
     """
-    Step 2. Returns (violations, elapsed_s, raw_text). Empty violations means
-    it passed. Each violation is {"category", "dimension", "detail"} (see
-    CONTENT_VIOLATION_CATEGORIES) -- structured so a batch can be grouped and
-    summarized by category (_compute_failure_summary) instead of by rough
-    text-similarity over free prose.
+    Step 2 (see _run_batch_validation for why this now runs before, not after,
+    the structural check). Returns (violations, elapsed_s, raw_text,
+    messages). Empty violations means it passed. Each violation is
+    {"category", "dimension", "detail"} (see CONTENT_VIOLATION_CATEGORIES) --
+    structured so a batch can be grouped and summarized by category
+    (_compute_failure_summary) instead of by rough text-similarity over free
+    prose. messages is the exact system+user prompt sent, returned so the
+    caller can persist/display the real conversion (see attempts_log's
+    content_messages/content_raw_response) instead of only a pass/fail label.
+
+    model defaults to config.CONTENT_VALIDATION_MODEL -- the production split
+    locked in app.py's config (qwen3.5:4b), independent of STUDY_MODEL/
+    QWEN_MODEL_SIZE. Callers comparing models on purpose (the CLI study tool,
+    or a live 4b-vs-9b divergence check) pass an explicit model instead.
 
     Runs on STUDY_VALIDATION_USES_AGENT no matter which path generation used --
     --mode changes generation only, so the validator stays a constant across both
     runs and the comparison measures what it claims to.
     """
+    model = model or config.CONTENT_VALIDATION_MODEL
     messages = build_validation_messages(report_json, student_record, mapping, question_bank)
     t0 = time.perf_counter()
     try:
         raw, _host, _metrics = study_generate(
-            messages, STUDY_VALIDATION_MODEL, STUDY_VALIDATION_USES_AGENT, hosts,
+            messages, model, STUDY_VALIDATION_USES_AGENT, hosts,
             json_schema=CONTENT_VALIDATION_VERDICT_SCHEMA)
     except Exception as exc:  # noqa: BLE001 -- a dead validator is a result, not a crash
         return ([_violation("unsupported_claim", "", f"validator call failed: {exc}")],
-                round(time.perf_counter() - t0, 3), None)
+                round(time.perf_counter() - t0, 3), None, messages)
     elapsed = round(time.perf_counter() - t0, 3)
 
     parsed = ollama_client._try_parse_json(raw)
     if not isinstance(parsed, dict) or "status" not in parsed:
         return ([_violation("unsupported_claim", "", "validator did not return a usable verdict")],
-                elapsed, raw)
+                elapsed, raw, messages)
     if str(parsed.get("status", "")).strip().lower() == "pass":
-        return [], elapsed, raw
+        return [], elapsed, raw, messages
     raw_violations = parsed.get("violations") or []
     if isinstance(raw_violations, str):
         raw_violations = [{"category": "unsupported_claim", "dimension": "", "detail": raw_violations}]
@@ -1126,7 +1358,7 @@ def validate_with_model(report_json, student_record, mapping, question_bank, hos
             violations.append(_violation("unsupported_claim", "", str(v)))
     if not violations:
         violations = [_violation("unsupported_claim", "", "validator returned fail with no violations given")]
-    return violations, elapsed, raw
+    return violations, elapsed, raw, messages
 
 
 # --- step 3: recurring-failure summary (only once every retry is exhausted) -
@@ -1205,7 +1437,7 @@ def summarize_recurring_failure(attempts_log, hosts=None):
     messages = build_failure_summary_messages(attempts_log)
     try:
         raw, _host, _metrics = study_generate(
-            messages, STUDY_VALIDATION_MODEL, STUDY_VALIDATION_USES_AGENT, hosts,
+            messages, config.CONTENT_VALIDATION_MODEL, STUDY_VALIDATION_USES_AGENT, hosts,
             json_schema=FAILURE_SUMMARY_SCHEMA)
         parsed = ollama_client._try_parse_json(raw)
         if isinstance(parsed, dict) and str(parsed.get("summary") or "").strip():
@@ -1346,7 +1578,13 @@ def _run_batch_validation(batch_id, student_ids=None):
     validation.json is left untouched, not reset to pending.
     """
     manifest = storage.load_manifest(batch_id)
-    mapping = csv_ingest.load_section_mapping()
+    # The mapping this batch was actually generated against (auto-generated or
+    # static) -- falls back to the static file only for a batch that predates
+    # this being saved per-batch.
+    try:
+        mapping = storage.load_batch_mapping(batch_id)
+    except FileNotFoundError:
+        mapping = csv_ingest.load_section_mapping()
     done = [s for s in manifest["students"] if s["status"] == "done"]
     if student_ids is not None:
         wanted = set(student_ids)
@@ -1372,7 +1610,8 @@ def _run_batch_validation(batch_id, student_ids=None):
     # None) starts every "done" student fresh, same as before this option existed.
     scoped_ids = {s["student_id"] for s in done}
     fresh_entries = {
-        s["student_id"]: {"student_id": s["student_id"], "name": s["name"], "status": "pending"}
+        s["student_id"]: {"student_id": s["student_id"], "name": s["name"],
+                           "status": "pending", "events": []}
         for s in done
     }
     if student_ids is None:
@@ -1413,6 +1652,16 @@ def _run_batch_validation(batch_id, student_ids=None):
     # is an approximation once max_workers > 1.
     state = {"consecutive_failures": 0, "processed": 0}
 
+    def add_event(entry, phase, message, status="running"):
+        """Persist a human-readable validation step as soon as it happens."""
+        entry.setdefault("events", []).append({
+            "at": datetime.now(timezone.utc).isoformat(),
+            "phase": phase,
+            "status": status,
+            "message": message,
+        })
+        storage.save_batch_validation(batch_id, validation)
+
     def _validate_one(entry):
         with lock:
             skip = (state["consecutive_failures"] >= VALIDATION_CIRCUIT_STREAK and
@@ -1429,15 +1678,18 @@ def _run_batch_validation(batch_id, student_ids=None):
                         "re-validate this student (or the remaining skipped ones) directly."),
                 )
                 validation["circuit_breaker_tripped"] = True
+                add_event(entry, "queue", "Skipped because the circuit breaker stopped the run", "skipped")
                 storage.save_batch_validation(batch_id, validation)
                 return
 
         sid = entry["student_id"]
         with lock:
             entry["status"] = "running"
-            storage.save_batch_validation(batch_id, validation)
+            add_event(entry, "start", "Validation started")
 
         try:
+            with lock:
+                add_event(entry, "input", "Reading report JSON from disk")
             report_json = storage.load_student_report(batch_id, sid)
         except FileNotFoundError:
             with lock:
@@ -1445,6 +1697,7 @@ def _run_batch_validation(batch_id, student_ids=None):
                              structural_errors=["report JSON not found on disk"],
                              content_checked=False, content_ok=None, content_violations=[],
                              attempts=[])
+                add_event(entry, "input", "Report JSON was not found on disk", "failed")
                 state["processed"] += 1
                 state["consecutive_failures"] += 1
                 validation["failure_summary"] = _compute_failure_summary(validation["students"])
@@ -1452,6 +1705,10 @@ def _run_batch_validation(batch_id, student_ids=None):
             return
 
         record = records_by_id.get(sid)
+        with lock:
+            add_event(entry, "input", "Report JSON loaded")
+            add_event(entry, "input", "Source answers loaded" if record is not None else
+                      "Source answers unavailable; content check will be skipped")
         # The instruction text isn't saved on the manifest itself, only inside
         # each student's own execution trace (build_prompt's input_data) -- read
         # it back from there so a regeneration uses the same instruction the
@@ -1477,13 +1734,44 @@ def _run_batch_validation(batch_id, student_ids=None):
         attempt = 0
         while True:
             attempt += 1
-            structural_errors = validate_structure(
-                report_content, mapping, valid_evidence_ids=valid_evidence_ids)
-            content_violations, content_checked = [], False
-            if not structural_errors and record is not None:
-                content_violations, _elapsed, _raw = validate_with_model(
+            # Content validation runs FIRST, structural SECOND -- only once
+            # content passes -- per the workflow order this was built to
+            # (deliberately the reverse of the old cheap-check-first design,
+            # which ran the free structural check before ever spending a
+            # model call). This needs report_content to already be a JSON
+            # object with something in it to judge, which it always is here:
+            # it was loaded from a file this app itself saved as valid JSON,
+            # or (on a retry) just parsed straight out of a fresh model
+            # response -- there is no "unparseable JSON" state to guard
+            # against reaching this point.
+            content_violations, content_checked, content_messages, content_raw = [], False, None, None
+            if record is not None:
+                with lock:
+                    add_event(entry, "content", f"Attempt {attempt}: checking content against source answers")
+                content_violations, _elapsed, content_raw, content_messages = validate_with_model(
                     report_content, record, mapping, question_bank)
                 content_checked = True
+                with lock:
+                    add_event(entry, "content",
+                              f"Content check {'passed' if not content_violations else 'failed'}",
+                              "passed" if not content_violations else "failed")
+            else:
+                with lock:
+                    add_event(entry, "content", "Content check skipped because source answers are unavailable", "skipped")
+
+            structural_errors = []
+            if not content_checked or not content_violations:
+                with lock:
+                    add_event(entry, "structural", f"Attempt {attempt}: checking JSON structure")
+                structural_errors = validate_structure(
+                    report_content, mapping, valid_evidence_ids=valid_evidence_ids)
+                with lock:
+                    add_event(entry, "structural",
+                              f"Structural check {'passed' if not structural_errors else 'failed'}",
+                              "passed" if not structural_errors else "failed")
+            else:
+                with lock:
+                    add_event(entry, "structural", "Structural check skipped because content check failed", "skipped")
             passed = not structural_errors and (not content_checked or not content_violations)
 
             attempts_log.append({
@@ -1493,10 +1781,18 @@ def _run_batch_validation(batch_id, student_ids=None):
                 "content_checked": content_checked,
                 "content_ok": (not content_violations) if content_checked else None,
                 "content_violations": content_violations,
+                # The real conversion, exactly as sent/received -- for
+                # "witnessing" the model call the same way generation's
+                # dashboard already shows Code/Input/Output, not just a
+                # pass/fail label.
+                "content_messages": content_messages,
+                "content_raw_response": content_raw,
                 "report_json": report_content,
             })
             with lock:
                 entry.update(attempts=attempts_log)
+                add_event(entry, "attempt", f"Attempt {attempt} recorded: {'passed' if passed else 'failed'}",
+                          "passed" if passed else "failed")
                 storage.save_batch_validation(batch_id, validation)
 
             # Stop regenerating once it passes, once the source answers needed to
@@ -1515,10 +1811,12 @@ def _run_batch_validation(batch_id, student_ids=None):
                 # dimension labels instead of free prose alone).
                 reasons = [f"[{v['category']}] {v['dimension'] or '(general)'}: {v['detail']}"
                            for v in content_violations]
+            with lock:
+                add_event(entry, "regeneration", f"Attempt {attempt} failed; regenerating report with validation feedback")
             try:
                 result = hermes_agent_client.generate_report_two_step(
                     record, mapping, instructions_text, question_bank=question_bank,
-                    model=config.get_active_ollama_model(),
+                    model=config.GENERATION_MODEL,
                     retry_feedback={"previous_output": raw_text, "reasons": reasons})
             except Exception as exc:  # noqa: BLE001 -- recorded, then this student stops retrying
                 attempts_log.append({
@@ -1530,10 +1828,13 @@ def _run_batch_validation(batch_id, student_ids=None):
                 })
                 with lock:
                     entry.update(attempts=attempts_log)
+                    add_event(entry, "regeneration", f"Regeneration failed: {exc}", "failed")
                 break
             parsed = result.get("parsed") or {}
             report_content = {k: v for k, v in parsed.items() if not k.startswith("_")}
             raw_text = result.get("raw_text") or json.dumps(report_content, ensure_ascii=False)
+            with lock:
+                add_event(entry, "regeneration", f"Regeneration complete; continuing with attempt {attempt + 1}", "passed")
 
         final = attempts_log[-1]
         with lock:
@@ -1548,6 +1849,9 @@ def _run_batch_validation(batch_id, student_ids=None):
                 report_json=final["report_json"],
                 attempts=attempts_log,
             )
+            add_event(entry, "complete", "Validation passed" if entry["passed"] else
+                      "Validation failed after all available attempts",
+                      "passed" if entry["passed"] else "failed")
 
         # A retry that ultimately passed produced a genuinely different report
         # than what's on disk -- write it back (JSON + PDF) so the batch is left
@@ -1805,7 +2109,7 @@ def run_bad_sample_check(valid_report, student_record, mapping, question_bank, h
                 "caught": True, "caught_at": "step 1 (structural)",
                 "errors": structural}
 
-    violations, elapsed, _raw = validate_with_model(
+    violations, elapsed, _raw, _messages = validate_with_model(
         bad, student_record, mapping, question_bank, hosts)
     errors = [f"[{v['category']}] {v['dimension'] or '(general)'}: {v['detail']}" for v in violations]
     return {"ran": True, "corrupted_field": field, "injected": injected,
@@ -1897,7 +2201,7 @@ def run_validation_study(students, mapping, use_agent=None, instructions_text=""
                 parsed, mapping,
                 valid_evidence_ids=prompt_builder.valid_answer_ids(cand["record"], question_bank))
             if not structural_errors:
-                raw_violations, val_s, _ = validate_with_model(
+                raw_violations, val_s, _raw, _messages = validate_with_model(
                     parsed, cand["record"], mapping, question_bank, hosts)
                 # Flattened to strings here so everything downstream in this CLI
                 # study tool (_study_log, _study_retry_messages, cand["history"])

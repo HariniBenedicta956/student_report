@@ -13,8 +13,12 @@
     <span class="flow-step disabled" title="Validate a batch first">3. Revalidate</span>
   </div>
 
-  <div class="gpu-badge" id="gpu-badge" title="Checked against the Ollama host before each run">
+  <button type="button" class="gpu-badge" id="gpu-badge" title="Checked against the Ollama host before each run — click for detail">
     Running on: <b id="gpu-badge-text">checking…</b>
+    <span class="gpu-badge-caret">▾</span>
+  </button>
+  <div class="card gpu-detail-panel" id="gpu-detail-panel" style="display:none;">
+    <div id="gpu-detail-body"></div>
   </div>
 
   <div class="error-banner" id="error-banner"></div>
@@ -44,9 +48,15 @@
         <path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke-linecap="round" stroke-linejoin="round"/>
         <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      <span id="qbank-text">Drop the full question bank here when the survey changes (e.g. UIT.md) — saved for review, not auto-applied</span>
+      <span id="qbank-text">Drop the full question bank here when the survey changes (e.g. UIT.md) — auto-generates the CSV/question mapping for this upload, no manual config needed</span>
       <span class="filename" id="qbank-filename"></span>
     </label>
+  </div>
+
+  <div class="card" id="mapping-review-panel" style="display:none;">
+    <p class="section-label">Auto-mapping — needs a look</p>
+    <p class="criteria-line">These columns weren't confidently matched to a question bank question (or were matched with low confidence) — check they're right, or map them by hand if this matters for scoring.</p>
+    <ul class="rubric-list" id="mapping-review-list"></ul>
   </div>
 
   <div class="card" id="student-select-card" style="display:none;">

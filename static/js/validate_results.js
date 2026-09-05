@@ -5,6 +5,7 @@ const detailPanel = document.getElementById("detail-panel");
 const detailTitle = document.getElementById("detail-title");
 const detailMeta = document.getElementById("detail-meta");
 const detailFailureSummary = document.getElementById("detail-failure-summary");
+const detailActivity = document.getElementById("detail-activity");
 const detailAttempts = document.getElementById("detail-attempts");
 const breakerBanner = document.getElementById("circuit-breaker-banner");
 const breakerText = document.getElementById("circuit-breaker-text");
@@ -174,20 +175,46 @@ function attemptBlock(a, index) {
   }
 
   const ranContent = a.content_checked;
+  const ranStructural = a.structural_ok !== null || (a.structural_errors && a.structural_errors.length);
   const rulesHeader = document.createElement("h3");
-  rulesHeader.textContent = `Rules checked — structural${ranContent ? " + content" : ""}`;
+  rulesHeader.textContent = `Rules checked — content${ranStructural ? " + structural" : ""} (content runs first; structural only if content passes)`;
   const rulesPre = document.createElement("pre");
   rulesPre.className = "code-view";
-  let rulesText = (window.STRUCTURAL_RULES || []).map((r, i) => `${i + 1}. ${r}`).join("\n");
+  let rulesText = "";
   if (ranContent) {
-    rulesText += "\n\ncontent (model call against the student's own answers):\n" +
+    rulesText += "content (model call against the student's own answers):\n" +
       (window.CONTENT_RUBRIC || []).map((r, i) => `${i + 1}. ${r}`).join("\n") +
       `\n\n${window.CONTENT_EXCLUSION || ""}`;
-  } else if (!a.structural_ok) {
-    rulesText += "\n\ncontent check: skipped — structural check failed first";
+  } else {
+    rulesText += "content check: skipped — no source answers available for this batch";
+  }
+  if (ranContent && !a.content_ok) {
+    rulesText += "\n\nstructural check: skipped — content check failed first";
+  } else {
+    rulesText += "\n\nstructural rules:\n" + (window.STRUCTURAL_RULES || []).map((r, i) => `${i + 1}. ${r}`).join("\n");
   }
   rulesPre.textContent = rulesText;
   block.append(rulesHeader, rulesPre);
+
+  // The real conversion -- exactly what was sent to the content validator
+  // and exactly what it returned, the same way generation's own dashboard
+  // shows Code/Input/Output rather than only a pass/fail label.
+  if (a.content_messages) {
+    const inHeader = document.createElement("h3");
+    inHeader.textContent = "Content validation — input sent to the model";
+    const inPre = document.createElement("pre");
+    inPre.className = "json-view";
+    inPre.textContent = JSON.stringify(a.content_messages, null, 2);
+    block.append(inHeader, inPre);
+  }
+  if (a.content_raw_response) {
+    const outHeader = document.createElement("h3");
+    outHeader.textContent = "Content validation — raw model output";
+    const outPre = document.createElement("pre");
+    outPre.className = "code-view";
+    outPre.textContent = a.content_raw_response;
+    block.append(outHeader, outPre);
+  }
 
   if (a.report_json) {
     const jsonHeader = document.createElement("h3");
@@ -202,13 +229,20 @@ function attemptBlock(a, index) {
   resultHeader.textContent = "Result";
   const resultPre = document.createElement("pre");
   resultPre.className = "json-view";
-  const lines = [`structural: ${a.structural_ok ? "ok" : "failed"}`];
-  (a.structural_errors || []).forEach((e) => lines.push(`  - ${e}`));
+  const lines = [];
   if (ranContent) {
     lines.push(`content: ${a.content_ok ? "ok" : "failed"}`);
     (a.content_violations || []).forEach((v) =>
       lines.push(`  - [${v.category}] ${v.dimension || "(general)"}: ${v.detail}`)
     );
+  } else {
+    lines.push("content: skipped (no source answers)");
+  }
+  if (!ranContent || a.content_ok) {
+    lines.push(`structural: ${a.structural_ok ? "ok" : "failed"}`);
+    (a.structural_errors || []).forEach((e) => lines.push(`  - ${e}`));
+  } else {
+    lines.push("structural: skipped (content failed first)");
   }
   resultPre.textContent = lines.join("\n");
   block.append(resultHeader, resultPre);
@@ -248,6 +282,26 @@ function renderDetail(entry, scroll) {
     detailFailureSummary.style.display = "block";
   } else {
     detailFailureSummary.style.display = "none";
+  }
+
+  const events = entry.events || [];
+  detailActivity.innerHTML = "";
+  if (events.length) {
+    const heading = document.createElement("h3");
+    heading.textContent = "Live validation activity";
+    detailActivity.appendChild(heading);
+    const list = document.createElement("ol");
+    list.className = "validation-events";
+    events.forEach((event) => {
+      const item = document.createElement("li");
+      item.className = `validation-event ${event.status || "running"}`;
+      const time = event.at ? new Date(event.at).toLocaleTimeString() : "";
+      item.innerHTML = `<span class="event-time">${escapeHtml(time)}</span>` +
+        `<span class="event-phase">${escapeHtml(event.phase || "step")}</span>` +
+        `<span>${escapeHtml(event.message)}</span>`;
+      list.appendChild(item);
+    });
+    detailActivity.appendChild(list);
   }
 
   detailAttempts.innerHTML = "";

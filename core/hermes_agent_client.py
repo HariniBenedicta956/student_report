@@ -135,8 +135,24 @@ def generate_report_two_step(student_record, mapping, instructions_text, questio
 
 
 def gpu_status():
-    """Report the live status of the active Qwen/Ollama host without any HTTP gateway."""
-    return ollama_client.study_gpu_status()
+    """
+    Live status of the active Qwen/Ollama host, with everything backing it a
+    real, current check -- not an assumed "healthy". study_gpu_status() is
+    /api/ps (VRAM residency, the authoritative GPU/CPU signal). nvidia_smi is
+    a real cross-check (GPU compute utilization, not just memory) when this
+    process happens to run on the GPU box itself; None -- explicitly, not
+    just absent -- when it doesn't, since this deployment normally runs on a
+    separate machine reaching Ollama over the network, and there is no way to
+    invoke nvidia-smi on a remote host over HTTP. recent_calls is real
+    latency/token data from actual completed calls (see
+    core/ollama_client._record_call), the closest equivalent this self-hosted
+    setup has to an API's latency/usage dashboard -- there is no "cost" here
+    since nothing is metered or billed.
+    """
+    status = ollama_client.study_gpu_status()
+    status["nvidia_smi"] = ollama_client.nvidia_smi_utilization()
+    status["recent_calls"] = ollama_client.recent_calls()
+    return status
 
 
 def warm_model():

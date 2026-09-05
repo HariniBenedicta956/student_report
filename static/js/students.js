@@ -132,9 +132,9 @@ document.getElementById("download-all-btn").addEventListener("click", () => {
   });
 });
 
-function applyStatuses(students) {
+function applyStatuses(manifest) {
+  const students = manifest.students;
   let allSettled = true;
-  let doneCount = 0;
   students.forEach((s) => {
     const row = document.querySelector(`#student-rows tr[data-student-id="${s.student_id}"]`);
     if (row) {
@@ -144,9 +144,21 @@ function applyStatuses(students) {
       statusEl.innerHTML = s.status === "pending"
         ? `${label}<span class="dots"><span>.</span><span>.</span><span>.</span></span>`
         : label;
+      // Real per-student processing time, from this student's own saved
+      // _perf (see /batch/<id>/students) -- not shown until it's actually
+      // known, never a placeholder.
+      const timeEl = row.querySelector(".proc-time");
+      if (timeEl) {
+        if (s.status === "done" && s.total_s != null) {
+          const retryNote = s.attempts > 1 ? ` (${s.attempts} attempts)` : "";
+          timeEl.textContent = `${s.total_s}s${retryNote}`;
+          timeEl.style.display = "block";
+        } else {
+          timeEl.style.display = "none";
+        }
+      }
     }
     if (s.status === "pending") allSettled = false;
-    if (s.status === "done") doneCount++;
 
     if (s.student_id === openStudentId) {
       if (s.status === "pending") {
@@ -160,7 +172,13 @@ function applyStatuses(students) {
       }
     }
   });
-  studentCount.textContent = `${students.length} students — ${doneCount} done`;
+  // done_count/error_count come from the server (see /batch/<id>/students),
+  // counted fresh from real manifest statuses -- a running, always-current
+  // success/failure count, not a client-side guess.
+  const doneCount = manifest.done_count || 0;
+  const errorCount = manifest.error_count || 0;
+  const failedNote = errorCount > 0 ? `, ${errorCount} failed` : "";
+  studentCount.textContent = `${students.length} students — ${doneCount} done${failedNote}`;
 
   // The Validate link is rendered server-side from the page's initial load state --
   // this keeps it in sync as students finish generating without needing a reload.
@@ -182,7 +200,7 @@ async function pollStatuses() {
   try {
     const res = await fetch(`/batch/${batchId}/students`);
     const manifest = await res.json();
-    const allSettled = applyStatuses(manifest.students);
+    const allSettled = applyStatuses(manifest);
     if (!allSettled) {
       setTimeout(pollStatuses, 2000);
     }

@@ -20,22 +20,22 @@
 
   <!-- Part 2: Validation -- what was checked, and the per-student result. -->
   <div class="card criteria-panel">
-    <p class="section-label">What each check verifies</p>
-    <p class="criteria-line"><strong>Structural check</strong> — pure Python, no model call: every
-      required field is present, correctly typed, and non-empty; each dimension's <code>tier</code> is
-      one of the four allowed values (Strength / Developing / Focus Required / Blind Spot); JSON parses
-      at all. It does not judge whether the content is true.</p>
-    <p class="criteria-line"><strong>Content check</strong> — a model call against the student's own
-      answers, judged against exactly this rubric (the literal instruction the model is given, not a
-      paraphrase):</p>
+    <p class="section-label">What each check verifies (content runs first, structural second)</p>
+    <p class="criteria-line"><strong>1. Content check</strong> — runs first, a model call
+      (qwen3.5:4b) against the student's own answers, judged against exactly this rubric (the
+      literal instruction the model is given, not a paraphrase):</p>
     <ol class="rubric-list">
       {% for item in content_rubric %}
       <li>{{ item }}</li>
       {% endfor %}
     </ol>
     <p class="criteria-line criteria-exclusion">{{ content_exclusion }}</p>
-    <p class="criteria-line">Skipped if the structural check already failed, or if this batch predates
-      per-student source-answer storage.</p>
+    <p class="criteria-line"><strong>2. Structural check</strong> — pure Python, no model call, runs
+      only once content passes: every required field is present, correctly typed, and non-empty;
+      each dimension's <code>tier</code> is one of the four allowed values (Strength / Developing /
+      Focus Required / Blind Spot); JSON parses at all. It does not judge whether the content is true.</p>
+    <p class="criteria-line">Content is skipped if this batch predates per-student source-answer
+      storage; structural is skipped if content failed first.</p>
   </div>
 
   <div class="card">
@@ -54,6 +54,7 @@
     <p class="section-label" id="detail-title">details</p>
     <div class="detail-meta" id="detail-meta"></div>
     <div class="error-banner" id="detail-failure-summary" style="display:none"></div>
+    <div class="validation-activity" id="detail-activity"></div>
     <div id="detail-attempts"></div>
   </div>
 

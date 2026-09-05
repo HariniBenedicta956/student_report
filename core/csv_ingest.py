@@ -8,6 +8,13 @@ import config
 
 QNUM_PATTERN = re.compile(r"^(Q\d+)\b")
 
+# Hyphen placeholders some exports write for a skipped question instead of
+# leaving the cell truly empty -- treated as unanswered for completion %.
+# Deliberately narrow: "n/a"/"none"/"nil" are left OUT because a real option
+# can legitimately read exactly that (e.g. a multi-select's "None of the
+# above"), which a hyphen can never be.
+NOT_ANSWERED_PLACEHOLDERS = {"-", "--", "—", "–"}
+
 
 class SectionMappingMissingError(RuntimeError):
     pass
@@ -114,15 +121,33 @@ def parse_csv(file_bytes, mapping):
 
         sections = {key: [] for key in mapping["sections"]}
         unmapped = []
+        answered_mapped_columns = set()
 
         for column, answer in row.items():
-            if column in identity_real_columns or column in ignored_real_columns:
+            if column in ignored_real_columns:
+                continue
+            # A column can be BOTH an identity column and a real mapped
+            # question at once -- an auto-generated mapping (see
+            # core/mapping_inference.py) deliberately does this for personal-
+            # ization when a form has no separate identity section (e.g. "1.
+            # What is your name?" is both this student's identity.name AND a
+            # completion-counted question). Only skip it here when it is
+            # identity-ONLY: still checking it for completion below is what
+            # makes that dual registration not silently mark a real answer
+            # as blank.
+            if column in identity_real_columns and column not in mapped_cols:
                 continue
             answer = (answer or "").strip()
-            if not answer:
+            # A blank cell isn't always literally empty -- some exports write
+            # a placeholder (a lone "-", "--", "n/a") for a skipped question
+            # instead of leaving it empty. Treated the same as empty for
+            # completion purposes; NOT_ANSWERED_PLACEHOLDERS is intentionally
+            # generic text, not specific to any one export tool's convention.
+            if not answer or answer.lower() in NOT_ANSWERED_PLACEHOLDERS:
                 continue
 
             if column in mapped_cols:
+                answered_mapped_columns.add(column)
                 section_key, q_config = mapped_cols[column]
                 is_multi = q_config.get("multi_select", False)
                 options = q_config.get("options_low_to_high", [])
@@ -143,7 +168,14 @@ def parse_csv(file_bytes, mapping):
                     # above, so two students can end up with different-length section
                     # lists, and positional numbering would silently pair a student's
                     # answer with the wrong question.
-                    "qid": q_config["column"],
+                    #
+                    # A separate "qid" is optional in the mapping -- the static,
+                    # hand-authored section_mapping.json doesn't set one, since its
+                    # "column" values (e.g. "Q8") already double as short ids. An
+                    # auto-generated mapping's "column" is the real CSV header
+                    # instead (needed to resolve it), which can be long and messy,
+                    # so it sets "qid" separately to a short id like "Q12" or "Q51a".
+                    "qid": q_config.get("qid") or q_config["column"],
                     "question": question_text,
                     "answer": answer,
                     "multi_select": is_multi,
@@ -157,11 +189,24 @@ def parse_csv(file_bytes, mapping):
         answered = sum(len(questions) for questions in sections.values())
         completion_pct = round(answered / total_mapped * 100, 1) if total_mapped else 0.0
 
+        # Exactly which mapped questions this student left null/empty/whitespace-
+        # only -- for showing an ineligible student's real gaps (Sync Eligibility),
+        # not just their percentage. mapped_cols already excludes identity/ignored
+        # columns, so this is precisely "answered questions ÷ total mapped
+        # questions" from the other side.
+        unanswered_questions = [
+            {"qid": q_config.get("qid") or q_config["column"],
+             "question": q_config.get("full_question") or col}
+            for col, (_section_key, q_config) in mapped_cols.items()
+            if col not in answered_mapped_columns
+        ]
+
         students.append({
             "identity": identity,
             "sections": sections,
             "unmapped": unmapped,
             "completion_pct": completion_pct,
+            "unanswered_questions": unanswered_questions,
         })
 
     return students

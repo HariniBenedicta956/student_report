@@ -66,6 +66,28 @@ def validation_path(batch_id):
     return os.path.join(batch_dir(batch_id), "validation.json")
 
 
+def mapping_path(batch_id):
+    return os.path.join(batch_dir(batch_id), "mapping.json")
+
+
+def save_batch_mapping(batch_id, mapping):
+    """
+    The exact mapping (static or auto-generated -- see core/mapping_inference.py)
+    that /generate parsed this batch's CSV against, saved with the batch itself.
+    /batch/<id>/validate reads it back from here rather than always reaching for
+    the static section_mapping.json, so a batch generated from a differently-
+    structured, auto-mapped form is still validated against the mapping that
+    actually matches it, not a mismatched default.
+    """
+    with open(mapping_path(batch_id), "w", encoding="utf-8") as f:
+        json.dump(mapping, f, indent=2)
+
+
+def load_batch_mapping(batch_id):
+    with open(mapping_path(batch_id), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def create_batch(student_records):
     batch_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     os.makedirs(_json_dir(batch_id), exist_ok=True)

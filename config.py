@@ -52,6 +52,26 @@ OLLAMA_QWEN3_9B_MODEL = os.environ.get("OLLAMA_QWEN3_9B_MODEL", "qwen3.5:9b")
 QWEN_MODEL_SIZE = os.environ.get("QWEN_MODEL_SIZE", "9b").strip().lower()
 OLLAMA_QWEN3_MODEL = OLLAMA_QWEN3_4B_MODEL if QWEN_MODEL_SIZE == "4b" else OLLAMA_QWEN3_9B_MODEL
 
+# The production model split, locked and explicit -- NOT derived from
+# QWEN_MODEL_SIZE above (that single toggle picks one model for both roles,
+# which is exactly what this isn't: generation and content validation are two
+# different tasks on two different models on purpose). Pinning these two
+# constants directly means a change to QWEN_MODEL_SIZE (e.g. for the CLI
+# study tool's own experiments) can never silently move the production
+# generate/validate split again.
+#
+# GENERATION_MODEL is temporarily 4b, not 9b: live-confirmed (2026-09-05) that
+# qwen3.5:9b does not fit in this deployment's available GPU VRAM --
+# /api/ps reported size_vram=0 out of 6.47GB, i.e. Ollama was silently running
+# it entirely on CPU (~4.7 tok/s vs 4b's ~80 tok/s on the same host), turning
+# a ~60-90s report into 1000+ seconds. 4b is confirmed fully GPU-resident on
+# this hardware. Switch this back to OLLAMA_QWEN3_9B_MODEL once the server-side
+# VRAM issue is resolved (check `nvidia-smi` / `ollama ps` directly on the GPU
+# host, and whether other loaded models -- this host also serves
+# qwen3-coder:30b, qwen3:14b, and others -- are holding VRAM 9b needs).
+GENERATION_MODEL = OLLAMA_QWEN3_4B_MODEL
+CONTENT_VALIDATION_MODEL = OLLAMA_QWEN3_4B_MODEL
+
 # Defaults to qwen so only qwen3.5:4b runs actively, per validation.md. The
 # previous Hermes default is kept commented rather than deleted.
 # MODEL_SELECTION = os.environ.get("MODEL_SELECTION", "hermes").strip().lower()

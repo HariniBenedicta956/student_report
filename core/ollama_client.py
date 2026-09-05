@@ -1,12 +1,42 @@
 import json
 import logging
+import threading
 import time
+from collections import deque
+from datetime import datetime, timezone
 
 import requests
 
 import config
 
 log = logging.getLogger(__name__)
+
+# Real, recent call outcomes -- what the status dropdown's "latency / token
+# usage" comes from, since this app calls a self-hosted model over HTTP, not
+# a metered third-party API with its own dashboard to check. In-memory only
+# (per process, lost on restart) -- this is a live "what just happened", not
+# an audit log; per-student numbers are already persisted separately (see
+# app.py's _perf on each saved report).
+_RECENT_CALLS = deque(maxlen=20)
+_recent_calls_lock = threading.Lock()
+
+
+def _record_call(host, model, metrics, ok, error_type=None):
+    with _recent_calls_lock:
+        _RECENT_CALLS.appendleft({
+            "at": datetime.now(timezone.utc).isoformat(),
+            "host": host, "model": model, "ok": ok, "error_type": error_type,
+            "latency_s": (metrics or {}).get("ollama_total_s"),
+            "prompt_tokens": (metrics or {}).get("prompt_tokens"),
+            "output_tokens": (metrics or {}).get("output_tokens"),
+            "tokens_per_sec": (metrics or {}).get("tokens_per_sec"),
+        })
+
+
+def recent_calls():
+    """A copy, newest first -- safe to hand straight to jsonify."""
+    with _recent_calls_lock:
+        return list(_RECENT_CALLS)
 
 CONNECT_TIMEOUT_SECONDS = 10  # fail fast on an unreachable host instead of hanging
 READ_TIMEOUT_SECONDS = 240  # a real generation call can legitimately take 1-3+ minutes
@@ -314,6 +344,7 @@ def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=
             parsed = _try_parse_json(raw)
             metrics["json_parse_s"] = round(time.perf_counter() - t0, 4)
             if parsed is not None:
+                _record_call(host, model, metrics, ok=True)
                 return {
                     "parsed": parsed, "attempts": attempt, "metrics": metrics,
                     "raw_text": raw, "host": host,
@@ -322,6 +353,7 @@ def generate_json(messages, model=None, on_retry=None, max_attempts=None, hosts=
             detail = f"model returned {len(raw)} chars that did not parse as JSON"
 
         if attempt >= max_attempts:
+            _record_call(hosts[0] if hosts else None, model, None, ok=False, error_type=error_type)
             error = OllamaUnavailableError(
                 f"{error_type} after {attempt} attempt(s): {detail}")
             error.error_type = error_type

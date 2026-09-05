@@ -35,7 +35,10 @@
         {% for s in students %}
         <tr data-student-id="{{ s.student_id }}">
           <td class="name">{{ s.name }}<br><span class="meta">{{ s.branch }}{% if s.year %} / {{ s.year }}{% endif %}</span></td>
-          <td class="status-cell"><span class="status {{ s.status }}">{{ s.status|capitalize }}{% if s.status == "pending" %}<span class="dots"><span>.</span><span>.</span><span>.</span></span>{% endif %}</span></td>
+          <td class="status-cell">
+            <span class="status {{ s.status }}">{{ s.status|capitalize }}{% if s.status == "pending" %}<span class="dots"><span>.</span><span>.</span><span>.</span></span>{% endif %}</span>
+            <span class="meta proc-time" style="display:none"></span>
+          </td>
           <td class="action-cell">
             <a class="link-btn" href="/batch/{{ batch_id }}/students/{{ s.student_id }}/dashboard">Dashboard</a>
             <button class="btn-secondary explore-btn" data-student-id="{{ s.student_id }}" data-name="{{ s.name }}">Explore</button>
